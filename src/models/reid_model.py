@@ -20,7 +20,7 @@ class VideoReIDModel(nn.Module):
     def __init__(
         self,
         feat_dim: int = 512,
-        num_blocks: int = 4,
+        num_blocks: int = 8,  # 文档建议 N=6~12，默认8
         mine_hidden_dim: int = 512,
     ):
         super().__init__()

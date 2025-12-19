@@ -87,7 +87,7 @@ def main():
     num_classes = 10
     feat_dim = 512
 
-    model = VideoReIDModel(feat_dim=feat_dim, num_blocks=4).to(device)
+    model = VideoReIDModel(feat_dim=feat_dim, num_blocks=8).to(device)  # 文档建议 N=6~12
     criterion = VideoReIDCriterion(
         feat_dim=feat_dim,
         num_classes=num_classes,

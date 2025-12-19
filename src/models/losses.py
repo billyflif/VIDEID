@@ -62,15 +62,28 @@ class IDLoss(nn.Module):
 
 def orthogonal_loss(id_feat: torch.Tensor, pose_feat: torch.Tensor) -> torch.Tensor:
     """
-    正交约束：最小化两组特征的内积。
+    正交约束：最小化两组特征的矩阵乘法Frobenius范数
+    L_orth = ||H_ID^T · H_NID||²_F
+    
+    如果输入是(B, D)，则计算 (D, B) × (B, D) = (D, D) 的Frobenius范数
+    如果输入是(B, T, D)，则对时间维度进行矩阵乘法
+    
     Args:
-        id_feat: (B, D)
-        pose_feat: (B, D)
+        id_feat: (B, D) 或 (B, T, D)
+        pose_feat: (B, D) 或 (B, T, D)
     """
-    id_n = F.normalize(id_feat, dim=-1)
-    pose_n = F.normalize(pose_feat, dim=-1)
-    prod = (id_n * pose_n).sum(dim=-1)
-    return (prod**2).mean()
+    if id_feat.dim() == 2:
+        # (B, D) -> (D, B) × (B, D) = (D, D)
+        # H_ID^T: (D, B), H_NID: (B, D)
+        prod = torch.matmul(id_feat.t(), pose_feat)  # (D, D)
+        return torch.norm(prod, p='fro') ** 2
+    elif id_feat.dim() == 3:
+        # (B, T, D) -> 对每个batch计算 (D, T) × (T, D) = (D, D)
+        # H_ID^T: (B, D, T), H_NID: (B, T, D)
+        prod = torch.bmm(id_feat.transpose(1, 2), pose_feat)  # (B, D, D)
+        return torch.norm(prod, p='fro', dim=(1, 2)).mean() ** 2
+    else:
+        raise ValueError(f"Unsupported feature dimension: {id_feat.dim()}")
 
 
 def temporal_smoothness_loss(feat: torch.Tensor) -> torch.Tensor:
