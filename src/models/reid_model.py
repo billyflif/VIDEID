@@ -30,7 +30,7 @@ class VideoReIDModel(nn.Module):
             [RDBMambaBlock(d_model=feat_dim) for _ in range(num_blocks)]
         )
 
-        self.agg = UncertaintyWeightedAggregator(lam=1.0)
+        self.agg = UncertaintyWeightedAggregator()
         self.mine = MINEEstimator(dim_x=feat_dim, dim_y=feat_dim, hidden_dim=mine_hidden_dim)
 
     def forward(self, x: torch.Tensor):

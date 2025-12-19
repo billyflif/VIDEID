@@ -5,16 +5,94 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+def batch_hard_triplet_loss(
+    feats: torch.Tensor,
+    labels: torch.Tensor,
+    margin: float = 0.3,
+    squared: bool = False,
+) -> torch.Tensor:
+    """
+    Batch-hard triplet loss实现
+    
+    对于每个anchor，选择：
+    - hardest positive: 同ID中距离最远的样本
+    - hardest negative: 不同ID中距离最近的样本
+    
+    Args:
+        feats: (B, D) 特征向量
+        labels: (B,) 标签
+        margin: triplet margin
+        squared: 是否使用平方距离
+    Returns:
+        loss: 标量损失值
+    """
+    # 计算所有样本对之间的成对距离
+    pairwise_dist = torch.cdist(feats, feats, p=2)  # (B, B)
+    if squared:
+        pairwise_dist = pairwise_dist ** 2
+    
+    # 创建mask：相同ID为True，不同ID为False
+    labels_equal = labels.unsqueeze(0) == labels.unsqueeze(1)  # (B, B)
+    
+    # 对于每个anchor，找到hardest positive和hardest negative
+    losses = []
+    
+    for i in range(len(feats)):
+        # Hardest positive: 同ID中距离最远的
+        positive_mask = labels_equal[i].clone()
+        positive_mask[i] = False  # 排除自己
+        if positive_mask.any():
+            hardest_positive_dist = pairwise_dist[i][positive_mask].max()
+        else:
+            # 如果没有其他正样本，跳过这个anchor
+            continue
+        
+        # Hardest negative: 不同ID中距离最近的
+        negative_mask = ~labels_equal[i]
+        if negative_mask.any():
+            hardest_negative_dist = pairwise_dist[i][negative_mask].min()
+        else:
+            # 如果没有负样本，跳过这个anchor
+            continue
+        
+        # 计算triplet loss
+        loss = torch.clamp(hardest_positive_dist - hardest_negative_dist + margin, min=0.0)
+        losses.append(loss)
+    
+    if len(losses) == 0:
+        return feats.new_tensor(0.0)
+    
+    return torch.stack(losses).mean()
+
+
 class IDLoss(nn.Module):
     """
-    身份损失：分类交叉熵 + 简单三元组约束。
+    身份损失：分类交叉熵 + 三元组约束（支持简单采样和batch-hard两种模式）
     """
 
-    def __init__(self, feat_dim: int, num_classes: int, margin: float = 0.3):
+    def __init__(
+        self,
+        feat_dim: int,
+        num_classes: int,
+        margin: float = 0.3,
+        use_batch_hard: bool = False,
+    ):
+        """
+        Args:
+            feat_dim: 特征维度
+            num_classes: 类别数
+            margin: triplet loss的margin
+            use_batch_hard: 是否使用batch-hard triplet mining
+        """
         super().__init__()
         self.classifier = nn.Linear(feat_dim, num_classes)
         self.ce = nn.CrossEntropyLoss()
-        self.triplet = nn.TripletMarginLoss(margin=margin, p=2)
+        self.margin = margin
+        self.use_batch_hard = use_batch_hard
+        
+        # 如果使用batch-hard，不需要TripletMarginLoss
+        if not use_batch_hard:
+            self.triplet = nn.TripletMarginLoss(margin=margin, p=2)
 
     def forward(self, feats: torch.Tensor, labels: torch.Tensor):
         """
@@ -29,33 +107,37 @@ class IDLoss(nn.Module):
         logits = self.classifier(feats)
         id_loss = self.ce(logits, labels)
 
-        # 简单构造三元组（仅在一个 batch 内随机采样）
-        # 实际项目中可替换为更稳定的 batch-hard triplet
-        with torch.no_grad():
-            anchors, positives, negatives = [], [], []
-            for y in labels.unique():
-                idx = (labels == y).nonzero(as_tuple=False).view(-1)
-                if len(idx) < 2:
-                    continue
-                # 随机取一对正样本
-                a, p = idx[0], idx[1]
-                # 随机取一个负样本
-                neg_idx = (labels != y).nonzero(as_tuple=False).view(-1)
-                if len(neg_idx) == 0:
-                    continue
-                n = neg_idx[0]
-                anchors.append(a)
-                positives.append(p)
-                negatives.append(n)
+        # 根据模式选择三元组损失计算方式
+        if self.use_batch_hard:
+            # Batch-hard triplet mining
+            triplet_loss = batch_hard_triplet_loss(feats, labels, margin=self.margin)
+        else:
+            # 简单构造三元组（仅在一个 batch 内随机采样）
+            with torch.no_grad():
+                anchors, positives, negatives = [], [], []
+                for y in labels.unique():
+                    idx = (labels == y).nonzero(as_tuple=False).view(-1)
+                    if len(idx) < 2:
+                        continue
+                    # 随机取一对正样本
+                    a, p = idx[0], idx[1]
+                    # 随机取一个负样本
+                    neg_idx = (labels != y).nonzero(as_tuple=False).view(-1)
+                    if len(neg_idx) == 0:
+                        continue
+                    n = neg_idx[0]
+                    anchors.append(a)
+                    positives.append(p)
+                    negatives.append(n)
 
-        triplet_loss = feats.new_tensor(0.0)
-        if anchors:
-            anchors = torch.stack(anchors)
-            positives = torch.stack(positives)
-            negatives = torch.stack(negatives)
-            triplet_loss = self.triplet(
-                feats[anchors], feats[positives], feats[negatives]
-            )
+            triplet_loss = feats.new_tensor(0.0)
+            if anchors:
+                anchors = torch.stack(anchors)
+                positives = torch.stack(positives)
+                negatives = torch.stack(negatives)
+                triplet_loss = self.triplet(
+                    feats[anchors], feats[positives], feats[negatives]
+                )
 
         return id_loss, triplet_loss, logits
 
@@ -134,9 +216,15 @@ class VideoReIDCriterion(nn.Module):
         lambda_temp: float = 0.1,
         lambda_kl: float = 0.01,
         margin: float = 0.3,
+        use_batch_hard: bool = False,
     ):
         super().__init__()
-        self.id_loss = IDLoss(feat_dim=feat_dim, num_classes=num_classes, margin=margin)
+        self.id_loss = IDLoss(
+            feat_dim=feat_dim,
+            num_classes=num_classes,
+            margin=margin,
+            use_batch_hard=use_batch_hard,
+        )
         self.lambda_mi = lambda_mi
         self.lambda_orth = lambda_orth
         self.lambda_temp = lambda_temp

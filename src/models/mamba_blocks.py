@@ -81,6 +81,8 @@ class QualityGatedMamba(nn.Module):
         self.delta_linear = nn.Linear(d_model, self.d_inner)
         self.softplus = nn.Softplus()
         self.alpha = nn.Parameter(torch.tensor(1.0, dtype=torch.float))
+        # 当σ_t²为向量时，将其映射到d_inner维度以逐元素调制
+        self.sigma_proj = nn.Linear(d_model, self.d_inner)
         
         # 激活函数
         self.act = nn.SiLU()
@@ -150,6 +152,9 @@ class QualityGatedMamba(nn.Module):
         """
         B, T, D = x.shape
         
+        # 保存原始输入用于计算Δ_raw（符合文档要求：Δ_raw = Softplus(Linear(x_t))）
+        x_original = x  # (B, T, d_model)
+        
         # ========== 步骤1: 输入投影 ==========
         xz = self.in_proj(x)  # (B, T, 2*d_inner)
         x, z = xz.chunk(2, dim=-1)  # 每个都是 (B, T, d_inner)
@@ -168,15 +173,19 @@ class QualityGatedMamba(nn.Module):
         
         # ========== 步骤4: 计算Quality-Gated Δ ==========
         # 按照文档要求：
-        # Δ_raw = Softplus(Linear(x))
+        # Δ_raw = Softplus(Linear(x_t))，其中x_t是输入到Mamba层的特征（维度d_model）
         # Δ_id = Δ_raw · exp(-α · σ_t²)
         
-        # 计算Δ_raw：从卷积后的特征x计算
-        # 使用专门的delta_linear层，符合文档要求
-        delta_raw = self.softplus(self.delta_linear(x))  # (B, T, d_inner)
+        # 计算Δ_raw：从原始输入x_original计算（符合文档要求）
+        delta_raw = self.softplus(self.delta_linear(x_original))  # (B, T, d_inner)
         
-        # 将标量不确定性σ_t²扩展到d_inner维度
-        sigma2_expand = sigma2.expand(B, T, self.d_inner)  # (B, T, d_inner)
+        # 将不确定性映射到d_inner维度
+        if sigma2.size(-1) == 1:
+            # 标量：直接broadcast
+            sigma2_expand = sigma2.expand(B, T, self.d_inner)  # (B, T, d_inner)
+        else:
+            # 向量：线性映射并确保非负
+            sigma2_expand = self.softplus(self.sigma_proj(sigma2))  # (B, T, d_inner)
         
         # 计算Quality-Gated Δ_id
         # 当σ_t²大（低质量帧）时，exp(-α·σ_t²)小，Δ_id变小，状态更新减弱
@@ -318,7 +327,8 @@ class RDBMambaBlock(nn.Module):
             nn.Sigmoid()
         )
 
-        self.alpha = alpha_pose_to_id
+        # 流交互参数γ：可学习参数（符合文档要求）
+        self.gamma = nn.Parameter(torch.tensor(alpha_pose_to_id, dtype=torch.float32))
 
     def forward(self, x_id: torch.Tensor, x_pose: torch.Tensor, sigma2: Optional[torch.Tensor] = None):
         """
@@ -350,6 +360,6 @@ class RDBMambaBlock(nn.Module):
         pose_out = self.pose_norm(pose_bi) + pose_res
 
         # ========== 姿态信息注入身份流 (no gradient) ==========
-        id_out = id_out + self.alpha * stop_gradient(pose_out)
+        id_out = id_out + self.gamma * stop_gradient(pose_out)
 
         return id_out, pose_out
