@@ -10,10 +10,16 @@
 """
 
 from typing import Dict, Optional
+import argparse
+import os
+import random
+from pathlib import Path
+import numpy as np
 
 import torch
 import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, random_split
+from torch.utils.tensorboard import SummaryWriter
 
 # 修复导入路径：支持作为模块和脚本两种运行方式
 try:
@@ -76,6 +82,16 @@ def collate_fn(batch):
     return videos, labels
 
 
+def set_seed(seed: int):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    if torch.backends.cudnn.is_available():
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+
+
 def train_one_epoch(
     model: nn.Module,
     criterion: nn.Module,
@@ -122,6 +138,8 @@ def train_one_epoch(
         
         optimizer_mine.zero_grad()
         loss_mine.backward(retain_graph=True)
+        if hasattr(model, "mine"):
+            torch.nn.utils.clip_grad_norm_(model.mine.parameters(), max_norm=5.0)
         optimizer_mine.step()
         
         # 2. 更新主模型（最小化MI估计和其他损失）
@@ -129,6 +147,7 @@ def train_one_epoch(
         
         optimizer_model.zero_grad()
         loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
         optimizer_model.step()
 
         bs = labels.size(0)
@@ -166,6 +185,40 @@ def train_one_epoch(
     return avg_dict
 
 
+@torch.no_grad()
+def evaluate(
+    model: nn.Module,
+    criterion: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+) -> Dict[str, float]:
+    model.eval()
+    criterion.eval()
+    total_loss = 0.0
+    total_samples = 0
+    loss_meter: Dict[str, float] = {}
+    correct = 0
+    for videos, labels in loader:
+        videos = videos.to(device)
+        labels = labels.to(device)
+        outputs = model(videos)
+        loss, loss_dict = criterion(outputs, labels)
+        bs = labels.size(0)
+        total_loss += loss.item() * bs
+        total_samples += bs
+        for k, v in loss_dict.items():
+            loss_meter[k] = loss_meter.get(k, 0.0) + float(v) * bs
+        vid_id = outputs["vid_id"]
+        logits = criterion.id_loss.classifier(vid_id)
+        preds = logits.argmax(dim=1)
+        correct += (preds == labels).sum().item()
+    avg_loss = total_loss / max(total_samples, 1)
+    avg_dict = {k: v / max(total_samples, 1) for k, v in loss_meter.items()}
+    avg_dict["total"] = avg_loss
+    avg_dict["acc"] = correct / max(total_samples, 1) if total_samples > 0 else 0.0
+    return avg_dict
+
+
 def get_lambda_kl_schedule(
     step: int,
     warmup_steps: int = 5000,
@@ -182,11 +235,49 @@ def get_lambda_kl_schedule(
     return target * ramp_progress
 
 
-def main():
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--num-epochs", type=int, default=2)
+    parser.add_argument("--batch-size", type=int, default=2)
+    parser.add_argument("--num-classes", type=int, default=10)
+    parser.add_argument("--feat-dim", type=int, default=512)
+    parser.add_argument("--num-train", type=int, default=32)
+    parser.add_argument("--num-val", type=int, default=16)
+    parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--mine-lr", type=float, default=1e-3)
+    parser.add_argument("--weight-decay", type=float, default=1e-4)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument("--log-dir", type=str, default="runs/video_reid")
+    parser.add_argument("--ckpt-dir", type=str, default="checkpoints")
+    parser.add_argument("--use-wandb", action="store_true")
+    parser.add_argument("--wandb-project", type=str, default="video_reid")
+    parser.add_argument("--wandb-run-name", type=str, default=None)
+    return parser.parse_args()
 
-    num_classes = 10
-    feat_dim = 512
+
+def main():
+    args = parse_args()
+    if args.device == "cuda" and not torch.cuda.is_available():
+        device = torch.device("cpu")
+    else:
+        device = torch.device(args.device)
+    set_seed(args.seed)
+    log_dir = Path(args.log_dir)
+    log_dir.mkdir(parents=True, exist_ok=True)
+    ckpt_dir = Path(args.ckpt_dir)
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    writer = SummaryWriter(log_dir=str(log_dir))
+    use_wandb = args.use_wandb
+    if use_wandb:
+        try:
+            import wandb
+            wandb.init(project=args.wandb_project, name=args.wandb_run_name)
+        except ImportError:
+            use_wandb = False
+
+    num_classes = args.num_classes
+    feat_dim = args.feat_dim
     
     # ========== 数据增强配置 ==========
     augmentation = VideoAugmentation(
@@ -219,16 +310,16 @@ def main():
     model_params = [p for n, p in model.named_parameters() if 'mine' not in n]
     optimizer_model = torch.optim.AdamW(
         model_params + list(criterion.parameters()),
-        lr=3e-4,
-        weight_decay=1e-4,
+        lr=args.lr,
+        weight_decay=args.weight_decay,
     )
     
     # MINE网络优化器：只优化MINE网络参数
     mine_params = [p for n, p in model.named_parameters() if 'mine' in n]
     optimizer_mine = torch.optim.AdamW(
         mine_params,
-        lr=1e-3,  # MINE网络通常使用稍大的学习率
-        weight_decay=1e-4,
+        lr=args.mine_lr,  # MINE网络通常使用稍大的学习率
+        weight_decay=args.weight_decay,
     )
     
     # ========== 不确定性监控器 ==========
@@ -239,23 +330,34 @@ def main():
     )
 
     # ========== 数据集和数据加载器 ==========
-    dataset = DummyVideoDataset(
-        num_samples=32,
+    full_dataset = DummyVideoDataset(
+        num_samples=args.num_train + args.num_val,
         num_classes=num_classes,
         T=8,
         augmentation=augmentation,  # 应用数据增强
     )
-    loader = DataLoader(
-        dataset,
-        batch_size=2,
+    train_size = args.num_train
+    val_size = args.num_val
+    train_dataset, val_dataset = random_split(full_dataset, [train_size, val_size])
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=args.batch_size,
         shuffle=True,
+        num_workers=0,
+        collate_fn=collate_fn,
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
         num_workers=0,
         collate_fn=collate_fn,
     )
 
     # ========== 训练循环 ==========
     global_step = 0
-    num_epochs = 2
+    num_epochs = args.num_epochs
+    best_val_acc = 0.0
     
     print("=" * 60)
     print("开始训练")
@@ -270,10 +372,10 @@ def main():
         current_lambda_kl = get_lambda_kl_schedule(global_step, warmup_steps=5000)
         criterion.lambda_kl = current_lambda_kl
         
-        loss_dict = train_one_epoch(
+        train_metrics = train_one_epoch(
             model,
             criterion,
-            loader,
+            train_loader,
             optimizer_model,
             optimizer_mine,
             device,
@@ -281,25 +383,63 @@ def main():
             global_step=global_step,
         )
         
-        global_step += len(loader)
+        global_step += len(train_loader)
+
+        val_metrics = evaluate(
+            model,
+            criterion,
+            val_loader,
+            device,
+        )
         
         print(f"\nEpoch {epoch + 1}/{num_epochs} (step {global_step}):")
-        print(f"  损失: {loss_dict.get('total', 0):.4f}")
-        print(f"  ID损失: {loss_dict.get('id', 0):.4f}")
-        print(f"  三元组损失: {loss_dict.get('triplet', 0):.4f}")
-        print(f"  MI损失: {loss_dict.get('mi', 0):.4f}")
-        print(f"  正交损失: {loss_dict.get('orth', 0):.4f}")
-        print(f"  时序平滑: {loss_dict.get('temp', 0):.4f}")
-        print(f"  KL损失: {loss_dict.get('kl', 0):.4f} (λ={current_lambda_kl:.4f})")
+        print(f"  训练损失: {train_metrics.get('total', 0):.4f}")
+        print(f"  验证损失: {val_metrics.get('total', 0):.4f}")
+        print(f"  验证准确率: {val_metrics.get('acc', 0):.4f}")
+        print(f"  ID损失: {train_metrics.get('id', 0):.4f}")
+        print(f"  三元组损失: {train_metrics.get('triplet', 0):.4f}")
+        print(f"  MI损失: {train_metrics.get('mi', 0):.4f}")
+        print(f"  正交损失: {train_metrics.get('orth', 0):.4f}")
+        print(f"  时序平滑: {train_metrics.get('temp', 0):.4f}")
+        print(f"  KL损失: {train_metrics.get('kl', 0):.4f} (λ={current_lambda_kl:.4f})")
         
-        # 打印监控信息
-        if 'sigma2_mean' in loss_dict:
-            print(f"\n  σ²统计:")
-            print(f"    均值: {loss_dict.get('sigma2_mean', 0):.6f}")
-            print(f"    标准差: {loss_dict.get('sigma2_std', 0):.6f}")
-            print(f"    帧间方差: {loss_dict.get('sigma2_frame_variance', 0):.6f}")
-            print(f"    健康状态: {loss_dict.get('sigma2_health_status', 'UNKNOWN')}")
-    
+        for k, v in train_metrics.items():
+            if isinstance(v, (int, float)):
+                writer.add_scalar(f"train/{k}", v, epoch)
+        for k, v in val_metrics.items():
+            if isinstance(v, (int, float)):
+                writer.add_scalar(f"val/{k}", v, epoch)
+        writer.flush()
+
+        if use_wandb:
+            log_data = {}
+            for k, v in train_metrics.items():
+                if isinstance(v, (int, float)):
+                    log_data[f"train/{k}"] = v
+            for k, v in val_metrics.items():
+                if isinstance(v, (int, float)):
+                    log_data[f"val/{k}"] = v
+            log_data["epoch"] = epoch + 1
+            log_data["lambda_kl"] = current_lambda_kl
+            wandb.log(log_data)
+
+        val_acc = val_metrics.get("acc", 0.0)
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
+            ckpt_path = ckpt_dir / "best.pth"
+            torch.save(
+                {
+                    "model": model.state_dict(),
+                    "criterion": criterion.state_dict(),
+                    "optimizer_model": optimizer_model.state_dict(),
+                    "optimizer_mine": optimizer_mine.state_dict(),
+                    "epoch": epoch + 1,
+                    "best_val_acc": best_val_acc,
+                    "args": vars(args),
+                },
+                ckpt_path,
+            )
+
     # 打印最终监控摘要
     print("\n" + "=" * 60)
     print("训练完成 - 监控摘要")

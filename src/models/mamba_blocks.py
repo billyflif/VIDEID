@@ -320,6 +320,7 @@ class RDBMambaBlock(nn.Module):
 
         self.id_norm = nn.LayerNorm(d_model)
         self.pose_norm = nn.LayerNorm(d_model)
+        self.pose_fusion = nn.Linear(2 * d_model, d_model)
         
         # 自适应融合的门控网络
         self.fusion_gate = nn.Sequential(
@@ -355,8 +356,9 @@ class RDBMambaBlock(nn.Module):
         pose_res = x_pose
         pose_fwd, pose_bwd = self.pose_layer(x_pose, None)
         
-        # 非身份流也进行简单的双向融合
-        pose_bi = 0.5 * pose_fwd + 0.5 * pose_bwd
+        # 非身份流也进行双向融合（拼接后线性变换）
+        pose_cat = torch.cat([pose_fwd, pose_bwd], dim=-1)
+        pose_bi = self.pose_fusion(pose_cat)
         pose_out = self.pose_norm(pose_bi) + pose_res
 
         # ========== 姿态信息注入身份流 (no gradient) ==========
