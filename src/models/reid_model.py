@@ -20,8 +20,9 @@ class VideoReIDModel(nn.Module):
     def __init__(
         self,
         feat_dim: int = 512,
-        num_blocks: int = 8,  # 文档建议 N=6~12，默认8
+        num_blocks: int = 4,  # 小数据场景减少层数防止过拟合（原默认8）
         mine_hidden_dim: int = 512,
+        block_dropout: float = 0.3,
     ):
         super().__init__()
         self.bvs = BayesianVisualStem(feat_dim=feat_dim, pretrained=True)
@@ -29,6 +30,8 @@ class VideoReIDModel(nn.Module):
         self.blocks = nn.ModuleList(
             [RDBMambaBlock(d_model=feat_dim) for _ in range(num_blocks)]
         )
+        # Mamba blocks之间的Dropout，防止过拟合
+        self.block_dropout = nn.Dropout(p=block_dropout)
 
         self.agg = UncertaintyWeightedAggregator()
         self.mine = MINEEstimator(dim_x=feat_dim, dim_y=feat_dim, hidden_dim=mine_hidden_dim)
@@ -48,6 +51,8 @@ class VideoReIDModel(nn.Module):
 
         for blk in self.blocks:
             h_id, h_pose = blk(h_id, h_pose, sigma2)
+            h_id = self.block_dropout(h_id)
+            h_pose = self.block_dropout(h_pose)
 
         # 视频级聚合
         vid_id, weights = self.agg(h_id, sigma2)

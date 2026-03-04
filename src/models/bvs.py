@@ -11,12 +11,15 @@ class BayesianVisualStem(nn.Module):
     - 输出：均值特征 mu (B, T, D)，不确定性 sigma2 (B, T, 1) 或 (B, T, D)
     """
 
-    def __init__(self, feat_dim: int = 512, pretrained: bool = True, uncertainty_dim: str = "scalar"):
+    def __init__(self, feat_dim: int = 512, pretrained: bool = True, uncertainty_dim: str = "scalar",
+                 freeze_layers: int = 3, dropout: float = 0.5):
         """
         Args:
             feat_dim: 特征维度
             pretrained: 是否使用预训练权重
             uncertainty_dim: 不确定性输出维度，"scalar"输出(B, T, 1)，"vector"输出(B, T, feat_dim)
+            freeze_layers: 冻结ResNet前N个layer（0=不冻结, 3=冻结conv1+bn1+layer1-3）
+            dropout: Dropout概率，防止小数据集过拟合
         """
         super().__init__()
         backbone = resnet50(pretrained=pretrained)
@@ -33,7 +36,19 @@ class BayesianVisualStem(nn.Module):
         )
         in_channels = backbone.fc.in_features
 
+        # 冻结预训练层以防止小数据过拟合
+        # freeze_layers=3: 冻结 conv1, bn1, layer1, layer2, layer3，仅训练 layer4 + heads
+        if freeze_layers > 0:
+            frozen_parts = [backbone.conv1, backbone.bn1]
+            layer_list = [backbone.layer1, backbone.layer2, backbone.layer3]
+            for i in range(min(freeze_layers, len(layer_list))):
+                frozen_parts.append(layer_list[i])
+            for module in frozen_parts:
+                for param in module.parameters():
+                    param.requires_grad = False
+
         self.global_pool = nn.AdaptiveAvgPool2d(1)
+        self.dropout = nn.Dropout(p=dropout)
         
         # Mean Head: 使用Linear层（符合文档要求）
         self.mu_head = nn.Linear(in_channels, feat_dim)
@@ -68,6 +83,7 @@ class BayesianVisualStem(nn.Module):
 
         # Mean Head: Linear层（符合文档要求）
         mu = self.mu_head(feat)  # (B*T, D)
+        mu = self.dropout(mu)    # Dropout防止过拟合
         mu = mu.view(b, t, -1)  # (B, T, D)
 
         # Variance Head: 支持标量和向量输出

@@ -130,13 +130,21 @@ class QualityGatedMamba(nn.Module):
             # 准备A矩阵
             A = -torch.exp(self.A_log.float())  # (d_inner, d_state)
             
+            # selective_scan_fn 要求 (B, d_inner, T) 布局，需要转置
+            x_ssm = x.transpose(1, 2).contiguous()        # (B, d_inner, T)
+            delta_ssm = delta.transpose(1, 2).contiguous() # (B, d_inner, T)
+            B_ssm = B_param.transpose(1, 2).contiguous()   # (B, d_state, T)
+            C_ssm = C_param.transpose(1, 2).contiguous()   # (B, d_state, T)
+            
             # 调用selective_scan
             y = selective_scan_fn(
-                x, delta, A, B_param, C_param, self.D.float()
+                x_ssm, delta_ssm, A, B_ssm, C_ssm, self.D.float()
             )
+            y = y.transpose(1, 2)  # 转回 (B, T, d_inner)
         else:
-            # Fallback: 简单的实现
-            y = x * delta.unsqueeze(-1)  # 简化版本
+            # Fallback: 使用delta均值调制输入（简化近似）
+            delta_scale = delta.mean(dim=-1, keepdim=True)  # (B, T, 1)
+            y = x * delta_scale
         
         # 输出投影
         y = y * self.act(z)
@@ -196,54 +204,50 @@ class QualityGatedMamba(nn.Module):
         A = -torch.exp(self.A_log.float())  # (d_inner, d_state)
         
         # ========== 步骤6: 调用selective_scan_fn ==========
-        # selective_scan_fn的签名通常是：
-        # selective_scan_fn(u, delta, A, B, C, D=None, ...)
-        # 其中：
-        # - u: (B, T, d_inner) - 输入
-        # - delta: (B, T, d_inner) - 时间步长（自定义的Quality-Gated delta）
-        # - A: (d_inner, d_state) - 状态矩阵
-        # - B: (B, T, d_state) - 输入矩阵
-        # - C: (B, T, d_state) - 输出矩阵
-        # - D: (d_inner,) - 跳跃连接
+        # selective_scan_fn 要求 (B, d_inner, T) 布局:
+        # - u: (B, d_inner, T)
+        # - delta: (B, d_inner, T)
+        # - A: (d_inner, d_state)
+        # - B: (B, d_state, T)
+        # - C: (B, d_state, T)
+        # - D: (d_inner,)
         
         # 确保所有参数在正确的设备上
         device = x.device
         A = A.to(device)
         D = self.D.float().to(device)
         
+        # 转置为 selective_scan_fn 所需的 (B, D, T) 布局
+        x_ssm = x.transpose(1, 2).contiguous()                # (B, d_inner, T)
+        delta_ssm = delta_custom.transpose(1, 2).contiguous()  # (B, d_inner, T)
+        B_ssm = B_param.transpose(1, 2).contiguous()           # (B, d_state, T)
+        C_ssm = C_param.transpose(1, 2).contiguous()           # (B, d_state, T)
+        
         try:
-            # 调用selective_scan_fn，传入自定义的Quality-Gated delta
-            # 这是关键：我们使用delta_custom而不是标准的delta计算
             y = selective_scan_fn(
-                u=x,  # (B, T, d_inner) - 输入
-                delta=delta_custom,  # (B, T, d_inner) - 自定义的Quality-Gated delta
-                A=A,  # (d_inner, d_state) - 状态矩阵
-                B=B_param,  # (B, T, d_state) - 输入矩阵
-                C=C_param,  # (B, T, d_state) - 输出矩阵
-                D=D,  # (d_inner,) - 跳跃连接
+                u=x_ssm,        # (B, d_inner, T)
+                delta=delta_ssm, # (B, d_inner, T)
+                A=A,            # (d_inner, d_state)
+                B=B_ssm,        # (B, d_state, T)
+                C=C_ssm,        # (B, d_state, T)
+                D=D,            # (d_inner,)
             )
+            y = y.transpose(1, 2)  # 转回 (B, T, d_inner)
         except TypeError as e:
-            # 如果参数顺序不对，尝试其他可能的调用方式
             try:
-                # 尝试使用mamba_inner_fn（如果可用）
                 if mamba_inner_fn is not None:
-                    y = mamba_inner_fn(
-                        x, delta_custom, A, B_param, C_param, D
-                    )
+                    y = mamba_inner_fn(x_ssm, delta_ssm, A, B_ssm, C_ssm, D)
+                    y = y.transpose(1, 2)  # 转回 (B, T, d_inner)
                 else:
                     raise e
             except Exception as e2:
-                # 如果都失败，使用fallback
                 import warnings
-                warnings.warn(f"selective_scan_fn failed: {e}, {e2}. Using fallback implementation.")
-                # 简化的fallback：使用delta调制输入
-                # 这不是精确的SSM，但至少能保证梯度流动
+                warnings.warn(f"selective_scan_fn failed: {e}, {e2}. Using fallback.")
                 delta_scale = delta_custom.mean(dim=-1, keepdim=True)  # (B, T, 1)
                 y = x * delta_scale
         except Exception as e:
-            # 其他错误也使用fallback
             import warnings
-            warnings.warn(f"selective_scan_fn failed: {e}. Using fallback implementation.")
+            warnings.warn(f"selective_scan_fn failed: {e}. Using fallback.")
             delta_scale = delta_custom.mean(dim=-1, keepdim=True)  # (B, T, 1)
             y = x * delta_scale
         

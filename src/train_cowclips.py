@@ -39,6 +39,7 @@ import cv2
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
+from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.tensorboard import SummaryWriter
 
 # 修复导入路径：支持作为模块和脚本两种运行方式
@@ -147,11 +148,17 @@ class VideoCowClipsDataset(Dataset):
         tensor = torch.from_numpy(arr).permute(0, 3, 1, 2)  # (T, 3, H, W)
         return tensor
 
+    # ImageNet归一化参数（匹配预训练ResNet50）
+    _IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
+    _IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
+
     def __getitem__(self, idx: int):
         video_path, label = self.samples[idx]
         video = self._load_video(video_path)
         if self.augmentation is not None:
             video = self.augmentation(video)
+        # ImageNet标准归一化（预训练ResNet50需要）
+        video = (video - self._IMAGENET_MEAN) / self._IMAGENET_STD
         return video, label
 
 
@@ -160,6 +167,64 @@ def collate_fn(batch):
     videos = torch.stack(videos, dim=0)  # (B, T, C, H, W)
     labels = torch.tensor(labels, dtype=torch.long)
     return videos, labels
+
+
+class PKBatchSampler:
+    """PK采样器：每个batch采样P个ID，每个ID采样K个样本。
+
+    确保每个batch中至少有P个不同的ID各K个正样本，
+    使triplet loss在小batch场景下仍然有效。
+    """
+
+    def __init__(self, dataset: VideoCowClipsDataset, p: int = 4, k: int = 2):
+        self.p = p
+        self.k = k
+        self.batch_size = p * k
+
+        # 构建 label -> indices 映射
+        self.label_to_indices: Dict[int, List[int]] = {}
+        for idx, (_, label) in enumerate(dataset.samples):
+            if label not in self.label_to_indices:
+                self.label_to_indices[label] = []
+            self.label_to_indices[label].append(idx)
+
+        self.labels = list(self.label_to_indices.keys())
+        if len(self.labels) < p:
+            self.p = len(self.labels)
+            self.batch_size = self.p * k
+
+        self._num_batches = max(1, len(dataset) // self.batch_size)
+
+    def __iter__(self):
+        for _ in range(self._num_batches):
+            batch = []
+            selected_labels = random.sample(self.labels, min(self.p, len(self.labels)))
+            for label in selected_labels:
+                indices = self.label_to_indices[label]
+                if len(indices) >= self.k:
+                    selected = random.sample(indices, self.k)
+                else:
+                    # 样本不足时过采样
+                    selected = random.choices(indices, k=self.k)
+                batch.extend(selected)
+            yield batch
+
+    def __len__(self):
+        return self._num_batches
+
+
+def compute_class_weights(dataset: VideoCowClipsDataset) -> torch.Tensor:
+    """根据训练集样本分布计算类权重（逆频率加权），处理类不均衡问题。"""
+    label_counts: Dict[int, int] = {}
+    for _, label in dataset.samples:
+        label_counts[label] = label_counts.get(label, 0) + 1
+
+    num_classes = max(label_counts.keys()) + 1
+    total_samples = sum(label_counts.values())
+    weights = torch.ones(num_classes)
+    for label, count in label_counts.items():
+        weights[label] = total_samples / (num_classes * count)
+    return weights
 
 
 def set_seed(seed: int):
@@ -189,6 +254,38 @@ def build_id_splits(root: Path, train_ratio: float, seed: int) -> Tuple[List[str
     train_ids = id_dirs[:n_train]
     test_ids = id_dirs[n_train:]
     return train_ids, test_ids
+
+
+def build_kfold_splits(root: Path, num_folds: int, seed: int) -> List[Tuple[List[str], List[str]]]:
+    """构建k-fold交叉验证的ID划分。
+
+    Args:
+        root: 数据根目录
+        num_folds: 折数
+        seed: 随机种子
+    Returns:
+        folds: 列表，每个元素为 (train_ids, test_ids) 元组
+    """
+    id_dirs = sorted([p.name for p in root.iterdir() if p.is_dir()])
+    if not id_dirs:
+        raise RuntimeError(f"在 {root} 下未找到任何ID目录")
+
+    rng = random.Random(seed)
+    rng.shuffle(id_dirs)
+
+    folds = []
+    fold_size = len(id_dirs) // num_folds
+    remainder = len(id_dirs) % num_folds
+
+    start = 0
+    for i in range(num_folds):
+        end = start + fold_size + (1 if i < remainder else 0)
+        test_ids = id_dirs[start:end]
+        train_ids = [d for d in id_dirs if d not in test_ids]
+        folds.append((train_ids, test_ids))
+        start = end
+
+    return folds
 
 
 def train_one_epoch(
@@ -247,8 +344,6 @@ def train_one_epoch(
             stats = monitor.update(sigma2)
             if stats is not None:
                 monitor_stats_list.append(stats)
-
-        global_step += 1
 
     avg_loss = total_loss / max(total_samples, 1)
     avg_dict = {k: v / max(total_samples, 1) for k, v in loss_meter.items()}
@@ -371,7 +466,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--feat-dim", type=int, default=512)
     parser.add_argument("--frames-per-clip", type=int, default=8)
-    parser.add_argument("--train-ratio", type=float, default=0.8, help="用于训练的 ID 比例，其余用于测试")
+    parser.add_argument("--train-ratio", type=float, default=0.8, help="用于训练的 ID 比例（仅单折时使用）")
+    parser.add_argument("--num-folds", type=int, default=5, help="交叉验证折数（1=单次划分，>1=k-fold交叉验证）")
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--mine-lr", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
@@ -412,188 +508,230 @@ def main() -> None:
 
     data_root = Path(args.data_root)
 
-    # ========== 构建 ID 划分 ==========
-    train_ids, test_ids = build_id_splits(data_root, train_ratio=args.train_ratio, seed=args.seed)
-    num_classes = len(train_ids) + len(test_ids)
+    # ========== 构建交叉验证划分 ==========
+    if args.num_folds > 1:
+        folds = build_kfold_splits(data_root, num_folds=args.num_folds, seed=args.seed)
+        print(f"使用 {args.num_folds}-fold 交叉验证")
+    else:
+        train_ids, test_ids = build_id_splits(data_root, train_ratio=args.train_ratio, seed=args.seed)
+        folds = [(train_ids, test_ids)]
+        print(f"使用单次划分 (train_ratio={args.train_ratio})")
 
-    print(f"共发现 ID 数: {num_classes} (train: {len(train_ids)}, test: {len(test_ids)})")
+    all_fold_metrics: List[Dict[str, float]] = []
 
-    # ========== 数据增强配置 ==========
-    augmentation = VideoAugmentation(
-        use_occlusion=True,
-        use_blur=True,
-        use_brightness=True,
-        occlusion_prob=0.5,
-        blur_prob=0.5,
-        brightness_prob=0.5,
-    )
+    for fold_idx, (train_ids, test_ids) in enumerate(folds):
+        num_classes = len(train_ids)  # 分类器仅覆盖训练ID
 
-    # ========== 构建数据集 ==========
-    train_dataset = VideoCowClipsDataset(
-        root=data_root,
-        id_list=train_ids,
-        use_clip="both",  # 训练阶段使用 clip1 和 clip2
-        frames_per_clip=args.frames_per_clip,
-        resize=(224, 224),
-        augmentation=augmentation,
-    )
+        print(f"\n{'='*60}")
+        print(f"Fold {fold_idx+1}/{len(folds)} | Train IDs: {len(train_ids)}, Test IDs: {len(test_ids)}")
+        print(f"{'='*60}")
 
-    gallery_dataset = VideoCowClipsDataset(
-        root=data_root,
-        id_list=test_ids,
-        use_clip="clip1",  # gallery 使用 clip1
-        frames_per_clip=args.frames_per_clip,
-        resize=(224, 224),
-        augmentation=None,
-    )
-
-    query_dataset = VideoCowClipsDataset(
-        root=data_root,
-        id_list=test_ids,
-        use_clip="clip2",  # query 使用 clip2
-        frames_per_clip=args.frames_per_clip,
-        resize=(224, 224),
-        augmentation=None,
-    )
-
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=0,
-        collate_fn=collate_fn,
-    )
-    gallery_loader = DataLoader(
-        gallery_dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=0,
-        collate_fn=collate_fn,
-    )
-    query_loader = DataLoader(
-        query_dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=0,
-        collate_fn=collate_fn,
-    )
-
-    # ========== 模型与损失函数 ==========
-    feat_dim = args.feat_dim
-    model = VideoReIDModel(feat_dim=feat_dim, num_blocks=8).to(device)
-
-    criterion = VideoReIDCriterion(
-        feat_dim=feat_dim,
-        num_classes=num_classes,
-        lambda_mi=0.1,
-        lambda_orth=0.01,
-        lambda_temp=0.1,
-        lambda_kl=0.01,
-        use_batch_hard=True,
-    ).to(device)
-
-    # ========== 优化器 ==========
-    model_params = [p for n, p in model.named_parameters() if "mine" not in n]
-    optimizer_model = torch.optim.AdamW(
-        model_params + list(criterion.parameters()),
-        lr=args.lr,
-        weight_decay=args.weight_decay,
-    )
-
-    mine_params = [p for n, p in model.named_parameters() if "mine" in n]
-    optimizer_mine = torch.optim.AdamW(
-        mine_params,
-        lr=args.mine_lr,
-        weight_decay=args.weight_decay,
-    )
-
-    monitor = UncertaintyMonitor(
-        window_size=100,
-        threshold=0.01,
-        check_interval=50,
-    )
-
-    # ========== 训练循环 ==========
-    global_step = 0
-    best_map = 0.0
-
-    print("=" * 60)
-    print("开始训练 (cow clips)")
-    print(f"训练 ID 数: {len(train_ids)}, 测试 ID 数: {len(test_ids)}")
-    print("=" * 60)
-
-    for epoch in range(args.num_epochs):
-        current_lambda_kl = get_lambda_kl_schedule(global_step, warmup_steps=5000)
-        criterion.lambda_kl = current_lambda_kl
-
-        train_metrics = train_one_epoch(
-            model,
-            criterion,
-            train_loader,
-            optimizer_model,
-            optimizer_mine,
-            device,
-            monitor=monitor,
-            global_step=global_step,
-        )
-        global_step += len(train_loader)
-
-        # 提取测试集特征并计算 ReID 指标
-        gallery_feats, gallery_labels = extract_video_features(model, gallery_loader, device)
-        query_feats, query_labels = extract_video_features(model, query_loader, device)
-        reid_metrics = compute_reid_metrics(query_feats, query_labels, gallery_feats, gallery_labels)
-
-        print(f"\nEpoch {epoch + 1}/{args.num_epochs} (step {global_step}):")
-        print(f"  训练损失: {train_metrics.get('total', 0):.4f}")
-        print(
-            "  ReID: "
-            + ", ".join([f"{k}={v:.4f}" for k, v in reid_metrics.items()])
+        # ========== 数据增强配置 ==========
+        augmentation = VideoAugmentation(
+            use_occlusion=True,
+            use_blur=True,
+            use_brightness=True,
+            occlusion_prob=0.5,
+            blur_prob=0.5,
+            brightness_prob=0.5,
         )
 
-        # TensorBoard 日志
-        for k, v in train_metrics.items():
-            if isinstance(v, (int, float)):
-                writer.add_scalar(f"train/{k}", v, epoch)
-        for k, v in reid_metrics.items():
-            if isinstance(v, (int, float)):
-                writer.add_scalar(f"reid/{k}", v, epoch)
-        writer.flush()
+        # ========== 构建数据集 ==========
+        train_dataset = VideoCowClipsDataset(
+            root=data_root,
+            id_list=train_ids,
+            use_clip="both",
+            frames_per_clip=args.frames_per_clip,
+            resize=(224, 224),
+            augmentation=augmentation,
+        )
 
-        # 可选 wandb 日志
-        if use_wandb:
-            import wandb
+        gallery_dataset = VideoCowClipsDataset(
+            root=data_root,
+            id_list=test_ids,
+            use_clip="clip1",
+            frames_per_clip=args.frames_per_clip,
+            resize=(224, 224),
+            augmentation=None,
+        )
 
-            log_data = {}
+        query_dataset = VideoCowClipsDataset(
+            root=data_root,
+            id_list=test_ids,
+            use_clip="clip2",
+            frames_per_clip=args.frames_per_clip,
+            resize=(224, 224),
+            augmentation=None,
+        )
+
+        # ========== PK采样器：保证每个batch有P个ID各K个正样本 ==========
+        pk_sampler = PKBatchSampler(train_dataset, p=4, k=2)
+        train_loader = DataLoader(
+            train_dataset,
+            batch_sampler=pk_sampler,
+            num_workers=0,
+            collate_fn=collate_fn,
+        )
+        gallery_loader = DataLoader(
+            gallery_dataset,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=0,
+            collate_fn=collate_fn,
+        )
+        query_loader = DataLoader(
+            query_dataset,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=0,
+            collate_fn=collate_fn,
+        )
+
+        # ========== 计算类权重（处理类不均衡） ==========
+        class_weights = compute_class_weights(train_dataset).to(device)
+
+        # ========== 模型与损失函数 ==========
+        feat_dim = args.feat_dim
+        model = VideoReIDModel(feat_dim=feat_dim, num_blocks=4).to(device)
+
+        criterion = VideoReIDCriterion(
+            feat_dim=feat_dim,
+            num_classes=num_classes,
+            lambda_mi=0.1,
+            lambda_orth=0.01,
+            lambda_temp=0.1,
+            lambda_kl=0.01,
+            use_batch_hard=True,
+            class_weights=class_weights,
+        ).to(device)
+
+        # ========== 优化器 ==========
+        model_params = [p for n, p in model.named_parameters() if "mine" not in n]
+        optimizer_model = torch.optim.AdamW(
+            model_params + list(criterion.parameters()),
+            lr=args.lr,
+            weight_decay=args.weight_decay,
+        )
+
+        mine_params = [p for n, p in model.named_parameters() if "mine" in n]
+        optimizer_mine = torch.optim.AdamW(
+            mine_params,
+            lr=args.mine_lr,
+            weight_decay=args.weight_decay,
+        )
+
+        # ========== 学习率调度器：余弦退火 ==========
+        scheduler = CosineAnnealingLR(optimizer_model, T_max=args.num_epochs, eta_min=1e-6)
+
+        monitor = UncertaintyMonitor(
+            window_size=100,
+            threshold=0.01,
+            check_interval=50,
+        )
+
+        # ========== 训练循环 ==========
+        global_step = 0
+        best_map = 0.0
+
+        for epoch in range(args.num_epochs):
+            # KL warmup：50步后开始，150步达到全额（适配小数据量）
+            current_lambda_kl = get_lambda_kl_schedule(
+                global_step, warmup_steps=50, ramp_steps=100
+            )
+            criterion.lambda_kl = current_lambda_kl
+
+            train_metrics = train_one_epoch(
+                model,
+                criterion,
+                train_loader,
+                optimizer_model,
+                optimizer_mine,
+                device,
+                monitor=monitor,
+                global_step=global_step,
+            )
+            global_step += len(train_loader)
+            scheduler.step()  # 更新学习率
+
+            # 提取测试集特征并计算 ReID 指标
+            gallery_feats, gallery_labels = extract_video_features(model, gallery_loader, device)
+            query_feats, query_labels = extract_video_features(model, query_loader, device)
+            reid_metrics = compute_reid_metrics(query_feats, query_labels, gallery_feats, gallery_labels)
+
+            current_lr = optimizer_model.param_groups[0]["lr"]
+            print(f"  Epoch {epoch+1}/{args.num_epochs} (step {global_step}, lr={current_lr:.2e}):")
+            print(f"    Loss: {train_metrics.get('total', 0):.4f}, "
+                  + ", ".join(f"{k}={v:.4f}" for k, v in reid_metrics.items()))
+
+            # TensorBoard 日志
+            prefix = f"fold{fold_idx}/" if len(folds) > 1 else ""
             for k, v in train_metrics.items():
                 if isinstance(v, (int, float)):
-                    log_data[f"train/{k}"] = v
+                    writer.add_scalar(f"{prefix}train/{k}", v, epoch)
             for k, v in reid_metrics.items():
                 if isinstance(v, (int, float)):
-                    log_data[f"reid/{k}"] = v
-            log_data["epoch"] = epoch + 1
-            log_data["lambda_kl"] = current_lambda_kl
-            wandb.log(log_data)
+                    writer.add_scalar(f"{prefix}reid/{k}", v, epoch)
+            writer.add_scalar(f"{prefix}lr", current_lr, epoch)
+            writer.flush()
 
-        # 保存最佳模型（按 mAP）
-        cur_map = reid_metrics.get("mAP", 0.0)
-        if cur_map > best_map:
-            best_map = cur_map
-            ckpt_path = ckpt_dir / "best_cowclips.pth"
-            torch.save(
-                {
-                    "model": model.state_dict(),
-                    "criterion": criterion.state_dict(),
-                    "optimizer_model": optimizer_model.state_dict(),
-                    "optimizer_mine": optimizer_mine.state_dict(),
-                    "epoch": epoch + 1,
-                    "best_mAP": best_map,
-                    "args": vars(args),
-                },
-                ckpt_path,
-            )
-            print(f"  [CKPT] 更新 best mAP={best_map:.4f}, 已保存到 {ckpt_path}")
+            # 可选 wandb 日志
+            if use_wandb:
+                import wandb
 
-    print("\n训练完成。最佳 mAP = {:.4f}".format(best_map))
+                log_data = {f"{prefix}train/{k}": v for k, v in train_metrics.items()
+                            if isinstance(v, (int, float))}
+                log_data.update({f"{prefix}reid/{k}": v for k, v in reid_metrics.items()
+                                 if isinstance(v, (int, float))})
+                log_data["epoch"] = epoch + 1
+                log_data["fold"] = fold_idx
+                log_data["lambda_kl"] = current_lambda_kl
+                log_data["lr"] = current_lr
+                wandb.log(log_data)
+
+            # 保存最佳模型（按 mAP）
+            cur_map = reid_metrics.get("mAP", 0.0)
+            if cur_map > best_map:
+                best_map = cur_map
+                ckpt_path = ckpt_dir / f"best_fold{fold_idx}.pth"
+                torch.save(
+                    {
+                        "model": model.state_dict(),
+                        "criterion": criterion.state_dict(),
+                        "optimizer_model": optimizer_model.state_dict(),
+                        "optimizer_mine": optimizer_mine.state_dict(),
+                        "epoch": epoch + 1,
+                        "best_mAP": best_map,
+                        "fold": fold_idx,
+                        "train_ids": train_ids,
+                        "test_ids": test_ids,
+                        "args": vars(args),
+                    },
+                    ckpt_path,
+                )
+                print(f"    [CKPT] best mAP={best_map:.4f} -> {ckpt_path}")
+
+        # 记录本折最终评估指标
+        gallery_feats, gallery_labels = extract_video_features(model, gallery_loader, device)
+        query_feats, query_labels = extract_video_features(model, query_loader, device)
+        fold_metrics = compute_reid_metrics(query_feats, query_labels, gallery_feats, gallery_labels)
+        fold_metrics["best_mAP"] = best_map
+        all_fold_metrics.append(fold_metrics)
+        print(f"\n  Fold {fold_idx+1} 最佳 mAP: {best_map:.4f}")
+
+    # ========== 汇总所有折的指标 ==========
+    print(f"\n{'='*60}")
+    print("交叉验证汇总")
+    print(f"{'='*60}")
+    if all_fold_metrics:
+        metric_keys = list(all_fold_metrics[0].keys())
+        for key in metric_keys:
+            values = [m[key] for m in all_fold_metrics]
+            mean_val = np.mean(values)
+            std_val = np.std(values)
+            print(f"  {key}: {mean_val:.4f} ± {std_val:.4f}")
+
+    writer.close()
+    print("\n训练完成。")
 
 
 if __name__ == "__main__":

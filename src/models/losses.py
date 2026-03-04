@@ -1,4 +1,4 @@
-from typing import Dict, Tuple
+from typing import Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -76,6 +76,7 @@ class IDLoss(nn.Module):
         num_classes: int,
         margin: float = 0.3,
         use_batch_hard: bool = False,
+        class_weights: Optional[torch.Tensor] = None,
     ):
         """
         Args:
@@ -83,10 +84,11 @@ class IDLoss(nn.Module):
             num_classes: 类别数
             margin: triplet loss的margin
             use_batch_hard: 是否使用batch-hard triplet mining
+            class_weights: 类别权重张量 (num_classes,)，用于处理类不均衡
         """
         super().__init__()
         self.classifier = nn.Linear(feat_dim, num_classes)
-        self.ce = nn.CrossEntropyLoss()
+        self.ce = nn.CrossEntropyLoss(weight=class_weights)
         self.margin = margin
         self.use_batch_hard = use_batch_hard
         
@@ -217,6 +219,7 @@ class VideoReIDCriterion(nn.Module):
         lambda_kl: float = 0.01,
         margin: float = 0.3,
         use_batch_hard: bool = False,
+        class_weights: Optional[torch.Tensor] = None,
     ):
         super().__init__()
         self.id_loss = IDLoss(
@@ -224,6 +227,7 @@ class VideoReIDCriterion(nn.Module):
             num_classes=num_classes,
             margin=margin,
             use_batch_hard=use_batch_hard,
+            class_weights=class_weights,
         )
         self.lambda_mi = lambda_mi
         self.lambda_orth = lambda_orth
