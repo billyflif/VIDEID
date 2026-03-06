@@ -40,8 +40,9 @@ class UncertaintyWeightedAggregator(nn.Module):
         F_video = Σ_t w_t · H_out[t]
     """
 
-    def __init__(self):
+    def __init__(self, use_uncertainty: bool = True):
         super().__init__()
+        self.use_uncertainty = use_uncertainty
 
     def forward(self, h: torch.Tensor, sigma2: torch.Tensor):
         """
@@ -53,6 +54,11 @@ class UncertaintyWeightedAggregator(nn.Module):
             weights: (B, T, 1)
         """
         # 如果sigma2是向量，需要先聚合为标量用于权重计算
+        if not self.use_uncertainty:
+            w = h.new_full((h.size(0), h.size(1), 1), 1.0 / max(h.size(1), 1))
+            feat = (h * w).sum(dim=1)
+            return feat, w
+
         if sigma2.dim() == 3 and sigma2.size(-1) > 1:
             # 向量不确定性：取均值或L2范数作为权重依据
             sigma2_scalar = sigma2.norm(dim=-1, keepdim=True)  # (B, T, 1)

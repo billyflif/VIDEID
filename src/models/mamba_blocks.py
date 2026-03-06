@@ -1,23 +1,30 @@
-from typing import Optional, Tuple
+from __future__ import annotations
+
+import warnings
+from typing import Optional
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from einops import rearrange
 
 try:
     from mamba_ssm.ops.selective_scan_interface import selective_scan_fn, mamba_inner_fn
     from mamba_ssm.modules.mamba_simple import Mamba
+
     HAS_SELECTIVE_SCAN = True
-except ImportError:
-    # Fallback for different mamba_ssm versions
-    try:
-        from mamba_ssm import Mamba
-        HAS_SELECTIVE_SCAN = False
-        selective_scan_fn = None
-        mamba_inner_fn = None
-    except ImportError:
-        raise ImportError("Please install mamba-ssm: pip install mamba-ssm")
+    MAMBA_BACKEND = "mamba_ssm_cuda"
+except Exception as exc:
+    from .mamba_reference import Mamba, selective_scan_fn
+
+    mamba_inner_fn = None
+    HAS_SELECTIVE_SCAN = True
+    MAMBA_BACKEND = "torch_reference"
+    warnings.warn(
+        "mamba_ssm CUDA extensions are unavailable, falling back to the exact PyTorch "
+        f"reference implementation. Training will be slower but the Mamba equations are unchanged. "
+        f"Original import error: {exc!r}",
+        RuntimeWarning,
+    )
 
 
 def stop_gradient(x: torch.Tensor) -> torch.Tensor:
@@ -25,16 +32,8 @@ def stop_gradient(x: torch.Tensor) -> torch.Tensor:
 
 
 class QualityGatedMamba(nn.Module):
-    """
-    完全实现的Quality-Gated Mamba层
-    使用selective_scan_interface手动传入自定义delta
-    
-    实现方式：
-    1. 完全复制Mamba的内部结构（in_proj, conv1d, x_proj, A_log, D, out_proj）
-    2. 重写forward方法，使用selective_scan_fn并传入自定义delta
-    3. delta计算：Δ_id = Δ_raw · exp(-α · σ_t²)
-    """
-    
+    """Quality-gated Mamba layer with a custom uncertainty-modulated delta."""
+
     def __init__(self, d_model: int, d_state: int = 16, d_conv: int = 4, expand: int = 2):
         super().__init__()
         self.d_model = d_model
@@ -42,260 +41,128 @@ class QualityGatedMamba(nn.Module):
         self.d_conv = d_conv
         self.expand = expand
         self.d_inner = int(self.expand * self.d_model)
-        self.dt_rank = max(16, self.d_model // 16)  # 默认dt_rank
-        
-        # 输入投影
+        self.dt_rank = max(16, self.d_model // 16)
+
         self.in_proj = nn.Linear(d_model, self.d_inner * 2, bias=False)
-        
-        # 1D卷积
         self.conv1d = nn.Conv1d(
             in_channels=self.d_inner,
             out_channels=self.d_inner,
             bias=True,
             kernel_size=d_conv,
-            groups=self.d_inner,  # 深度可分离卷积
+            groups=self.d_inner,
             padding=d_conv - 1,
         )
-        
-        # x_proj: 投影得到B, C, delta_raw
-        # B和C的维度是 (d_inner, d_state)
-        # delta的维度是 (d_inner, dt_rank)
         self.x_proj = nn.Linear(self.d_inner, self.d_state * 2 + self.dt_rank, bias=False)
-        
-        # dt_proj: 将delta从dt_rank投影到d_inner
         self.dt_proj = nn.Linear(self.dt_rank, self.d_inner, bias=True)
-        
-        # A_log: 状态矩阵A的对数形式 (d_inner, d_state)
-        # 使用可学习的参数，初始化为负值以确保稳定性
+
         A = torch.arange(1, self.d_state + 1, dtype=torch.float32).repeat(self.d_inner, 1)
         self.A_log = nn.Parameter(torch.log(A))
-        
-        # D: 跳跃连接参数 (d_inner,)
         self.D = nn.Parameter(torch.ones(self.d_inner))
-        
-        # 输出投影
         self.out_proj = nn.Linear(self.d_inner, d_model, bias=False)
-        
-        # Quality-Gated Δ相关参数
-        # 用于计算Δ_raw的线性层（替代标准的dt_proj计算）
+
         self.delta_linear = nn.Linear(d_model, self.d_inner)
         self.softplus = nn.Softplus()
-        self.alpha = nn.Parameter(torch.tensor(1.0, dtype=torch.float))
-        # 当σ_t²为向量时，将其映射到d_inner维度以逐元素调制
+        self.alpha = nn.Parameter(torch.tensor(1.0, dtype=torch.float32))
         self.sigma_proj = nn.Linear(d_model, self.d_inner)
-        
-        # 激活函数
         self.act = nn.SiLU()
-    
-    def forward(self, x: torch.Tensor, sigma2: Optional[torch.Tensor] = None):
-        """
-        Args:
-            x: (B, T, D)
-            sigma2: (B, T, 1), 不确定性（可选）
-        Returns:
-            out: (B, T, D)
-        """
+
+    def forward(self, x: torch.Tensor, sigma2: Optional[torch.Tensor] = None) -> torch.Tensor:
         if sigma2 is None or not HAS_SELECTIVE_SCAN:
-            # 没有不确定性或selective_scan不可用，使用标准Mamba逻辑
             return self._forward_standard(x)
-        
-        # 使用自定义delta的完整实现
         return self._forward_with_custom_delta(x, sigma2)
-    
-    def _forward_standard(self, x: torch.Tensor):
-        """标准Mamba前向传播（fallback）"""
-        B, T, D = x.shape
-        
-        # 输入投影
-        xz = self.in_proj(x)  # (B, T, 2*d_inner)
-        x, z = xz.chunk(2, dim=-1)  # 每个都是 (B, T, d_inner)
-        
-        # 1D卷积
-        x = x.transpose(1, 2)  # (B, d_inner, T)
-        x = self.conv1d(x)[:, :, :T]  # 裁剪padding
-        x = x.transpose(1, 2)  # (B, T, d_inner)
-        x = self.act(x)
-        
-        # x_proj得到B, C, delta
-        x_dbl = self.x_proj(x)  # (B, T, d_state*2 + dt_rank)
+
+    def _depthwise_conv(self, x: torch.Tensor) -> torch.Tensor:
+        seq_len = x.shape[1]
+        x = x.transpose(1, 2)
+        x = self.conv1d(x)[:, :, :seq_len]
+        x = x.transpose(1, 2)
+        return self.act(x)
+
+    def _run_scan(
+        self,
+        x: torch.Tensor,
+        delta: torch.Tensor,
+        B_param: torch.Tensor,
+        C_param: torch.Tensor,
+    ) -> torch.Tensor:
+        A = -torch.exp(self.A_log.float()).to(x.device)
+        D = self.D.float().to(x.device)
+        y = selective_scan_fn(
+            u=x.transpose(1, 2).contiguous(),
+            delta=delta.transpose(1, 2).contiguous(),
+            A=A,
+            B=B_param.transpose(1, 2).contiguous(),
+            C=C_param.transpose(1, 2).contiguous(),
+            D=D,
+        )
+        return y.transpose(1, 2)
+
+    def _forward_standard(self, x: torch.Tensor) -> torch.Tensor:
+        xz = self.in_proj(x)
+        x, z = xz.chunk(2, dim=-1)
+        x = self._depthwise_conv(x)
+
+        x_dbl = self.x_proj(x)
         B_param, C_param, delta_raw = x_dbl.split(
             [self.d_state, self.d_state, self.dt_rank], dim=-1
         )
-        
-        # delta处理
-        delta = F.softplus(self.dt_proj(delta_raw))  # (B, T, d_inner)
-        
-        # 如果selective_scan_fn可用，使用它
-        if HAS_SELECTIVE_SCAN and selective_scan_fn is not None:
-            # 准备A矩阵
-            A = -torch.exp(self.A_log.float())  # (d_inner, d_state)
-            
-            # selective_scan_fn 要求 (B, d_inner, T) 布局，需要转置
-            x_ssm = x.transpose(1, 2).contiguous()        # (B, d_inner, T)
-            delta_ssm = delta.transpose(1, 2).contiguous() # (B, d_inner, T)
-            B_ssm = B_param.transpose(1, 2).contiguous()   # (B, d_state, T)
-            C_ssm = C_param.transpose(1, 2).contiguous()   # (B, d_state, T)
-            
-            # 调用selective_scan
-            y = selective_scan_fn(
-                x_ssm, delta_ssm, A, B_ssm, C_ssm, self.D.float()
-            )
-            y = y.transpose(1, 2)  # 转回 (B, T, d_inner)
-        else:
-            # Fallback: 使用delta均值调制输入（简化近似）
-            delta_scale = delta.mean(dim=-1, keepdim=True)  # (B, T, 1)
-            y = x * delta_scale
-        
-        # 输出投影
+        delta = F.softplus(self.dt_proj(delta_raw))
+        y = self._run_scan(x, delta, B_param, C_param)
         y = y * self.act(z)
-        out = self.out_proj(y)
-        
-        return out
-    
-    def _forward_with_custom_delta(self, x: torch.Tensor, sigma2: torch.Tensor):
-        """
-        使用自定义delta的完整selective_scan实现
-        
-        这是完全精确的实现，直接调用selective_scan_fn并传入自定义delta
-        """
-        B, T, D = x.shape
-        
-        # 保存原始输入用于计算Δ_raw（符合文档要求：Δ_raw = Softplus(Linear(x_t))）
-        x_original = x  # (B, T, d_model)
-        
-        # ========== 步骤1: 输入投影 ==========
-        xz = self.in_proj(x)  # (B, T, 2*d_inner)
-        x, z = xz.chunk(2, dim=-1)  # 每个都是 (B, T, d_inner)
-        
-        # ========== 步骤2: 1D卷积 ==========
-        x = x.transpose(1, 2)  # (B, d_inner, T)
-        x = self.conv1d(x)[:, :, :T]  # 裁剪padding
-        x = x.transpose(1, 2)  # (B, T, d_inner)
-        x = self.act(x)
-        
-        # ========== 步骤3: 计算B, C参数和基础delta ==========
-        x_dbl = self.x_proj(x)  # (B, T, d_state*2 + dt_rank)
-        B_param, C_param, delta_raw_proj = x_dbl.split(
-            [self.d_state, self.d_state, self.dt_rank], dim=-1
-        )
-        
-        # ========== 步骤4: 计算Quality-Gated Δ ==========
-        # 按照文档要求：
-        # Δ_raw = Softplus(Linear(x_t))，其中x_t是输入到Mamba层的特征（维度d_model）
-        # Δ_id = Δ_raw · exp(-α · σ_t²)
-        
-        # 计算Δ_raw：从原始输入x_original计算（符合文档要求）
-        delta_raw = self.softplus(self.delta_linear(x_original))  # (B, T, d_inner)
-        
-        # 将不确定性映射到d_inner维度
+        return self.out_proj(y)
+
+    def _forward_with_custom_delta(self, x: torch.Tensor, sigma2: torch.Tensor) -> torch.Tensor:
+        batch_size, seq_len, _ = x.shape
+        x_original = x
+
+        xz = self.in_proj(x)
+        x, z = xz.chunk(2, dim=-1)
+        x = self._depthwise_conv(x)
+
+        x_dbl = self.x_proj(x)
+        B_param, C_param, _ = x_dbl.split([self.d_state, self.d_state, self.dt_rank], dim=-1)
+
+        delta_raw = self.softplus(self.delta_linear(x_original))
         if sigma2.size(-1) == 1:
-            # 标量：直接broadcast
-            sigma2_expand = sigma2.expand(B, T, self.d_inner)  # (B, T, d_inner)
+            sigma2_expand = sigma2.expand(batch_size, seq_len, self.d_inner)
         else:
-            # 向量：线性映射并确保非负
-            sigma2_expand = self.softplus(self.sigma_proj(sigma2))  # (B, T, d_inner)
-        
-        # 计算Quality-Gated Δ_id
-        # 当σ_t²大（低质量帧）时，exp(-α·σ_t²)小，Δ_id变小，状态更新减弱
-        # 这实现了"当帧质量低时，SSM状态 h_t ≈ h_{t-1}"的效果
-        delta_custom = delta_raw * torch.exp(-self.alpha * sigma2_expand)  # (B, T, d_inner)
-        
-        # ========== 步骤5: 准备A矩阵 ==========
-        A = -torch.exp(self.A_log.float())  # (d_inner, d_state)
-        
-        # ========== 步骤6: 调用selective_scan_fn ==========
-        # selective_scan_fn 要求 (B, d_inner, T) 布局:
-        # - u: (B, d_inner, T)
-        # - delta: (B, d_inner, T)
-        # - A: (d_inner, d_state)
-        # - B: (B, d_state, T)
-        # - C: (B, d_state, T)
-        # - D: (d_inner,)
-        
-        # 确保所有参数在正确的设备上
-        device = x.device
-        A = A.to(device)
-        D = self.D.float().to(device)
-        
-        # 转置为 selective_scan_fn 所需的 (B, D, T) 布局
-        x_ssm = x.transpose(1, 2).contiguous()                # (B, d_inner, T)
-        delta_ssm = delta_custom.transpose(1, 2).contiguous()  # (B, d_inner, T)
-        B_ssm = B_param.transpose(1, 2).contiguous()           # (B, d_state, T)
-        C_ssm = C_param.transpose(1, 2).contiguous()           # (B, d_state, T)
-        
-        try:
-            y = selective_scan_fn(
-                u=x_ssm,        # (B, d_inner, T)
-                delta=delta_ssm, # (B, d_inner, T)
-                A=A,            # (d_inner, d_state)
-                B=B_ssm,        # (B, d_state, T)
-                C=C_ssm,        # (B, d_state, T)
-                D=D,            # (d_inner,)
-            )
-            y = y.transpose(1, 2)  # 转回 (B, T, d_inner)
-        except TypeError as e:
-            try:
-                if mamba_inner_fn is not None:
-                    y = mamba_inner_fn(x_ssm, delta_ssm, A, B_ssm, C_ssm, D)
-                    y = y.transpose(1, 2)  # 转回 (B, T, d_inner)
-                else:
-                    raise e
-            except Exception as e2:
-                import warnings
-                warnings.warn(f"selective_scan_fn failed: {e}, {e2}. Using fallback.")
-                delta_scale = delta_custom.mean(dim=-1, keepdim=True)  # (B, T, 1)
-                y = x * delta_scale
-        except Exception as e:
-            import warnings
-            warnings.warn(f"selective_scan_fn failed: {e}. Using fallback.")
-            delta_scale = delta_custom.mean(dim=-1, keepdim=True)  # (B, T, 1)
-            y = x * delta_scale
-        
-        # ========== 步骤7: 输出投影 ==========
+            sigma2_expand = self.softplus(self.sigma_proj(sigma2))
+        delta_custom = delta_raw * torch.exp(-self.alpha * sigma2_expand)
+
+        y = self._run_scan(x, delta_custom, B_param, C_param)
         y = y * self.act(z)
-        out = self.out_proj(y)
-        
-        return out
+        return self.out_proj(y)
 
 
 class BiMambaLayer(nn.Module):
-    """
-    双向 Mamba：
-    - 前向扫描 + 后向扫描
-    - 支持Quality-Gated Δ（通过selective_scan_interface）
-    - 只返回fwd_out和bwd_out，不进行内部融合
-    """
+    """Bidirectional Mamba layer with optional quality gating."""
 
     def __init__(
         self,
         d_model: int,
         use_quality_gating: bool = False,
-    ):
+        bidirectional: bool = True,
+    ) -> None:
         super().__init__()
         self.use_quality_gating = use_quality_gating
+        self.bidirectional = bidirectional
 
         if use_quality_gating:
             self.fwd = QualityGatedMamba(d_model=d_model)
-            self.bwd = QualityGatedMamba(d_model=d_model)
+            self.bwd = QualityGatedMamba(d_model=d_model) if bidirectional else None
         else:
             self.fwd = Mamba(d_model=d_model)
-            self.bwd = Mamba(d_model=d_model)
+            self.bwd = Mamba(d_model=d_model) if bidirectional else None
 
     def forward(self, x: torch.Tensor, u: Optional[torch.Tensor] = None):
-        """
-        Args:
-            x: (B, T, D)
-            u: (B, T, 1), 不确定性（可选）
-        Returns:
-            fwd_out, bwd_out: (B, T, D) - 只返回前向和后向输出，不进行融合
-        """
-        # 前向扫描
         if self.use_quality_gating and u is not None:
             fwd_out = self.fwd(x, u)
         else:
             fwd_out = self.fwd(x)
 
-        # 反向扫描
+        if not self.bidirectional or self.bwd is None:
+            return fwd_out, None
+
         rev_x = torch.flip(x, dims=[1])
         if self.use_quality_gating and u is not None:
             rev_u = torch.flip(u, dims=[1])
@@ -303,69 +170,81 @@ class BiMambaLayer(nn.Module):
         else:
             bwd_out = self.bwd(rev_x)
         bwd_out = torch.flip(bwd_out, dims=[1])
-
-        # 不再进行内部融合，只返回原始输出
         return fwd_out, bwd_out
 
 
 class RDBMambaBlock(nn.Module):
-    """
-    Residual Decoupled Bi-Mamba Block
-    - 身份流 (ID stream): 使用Quality-Gated Δ
-    - 非身份流 (Pose / Non-ID stream): 标准Mamba
-    - 双向扫描 + 自适应融合（仅在Block层面）
-    - 残差连接 + 跨流信息注入
-    """
+    """Residual decoupled bidirectional Mamba block."""
 
-    def __init__(self, d_model: int, quality_gated: bool = True, alpha_pose_to_id: float = 0.1):
+    def __init__(
+        self,
+        d_model: int,
+        quality_gated: bool = True,
+        bidirectional: bool = True,
+        use_pose_stream: bool = True,
+        use_pose_to_id: bool = True,
+        alpha_pose_to_id: float = 0.1,
+    ) -> None:
         super().__init__()
-        self.id_layer = BiMambaLayer(d_model, use_quality_gating=quality_gated)
-        self.pose_layer = BiMambaLayer(d_model, use_quality_gating=False)
-
-        self.id_norm = nn.LayerNorm(d_model)
-        self.pose_norm = nn.LayerNorm(d_model)
-        self.pose_fusion = nn.Linear(2 * d_model, d_model)
-        
-        # 自适应融合的门控网络
-        self.fusion_gate = nn.Sequential(
-            nn.Linear(d_model, d_model),
-            nn.Sigmoid()
+        self.use_pose_stream = use_pose_stream
+        self.use_pose_to_id = use_pose_stream and use_pose_to_id
+        self.id_layer = BiMambaLayer(
+            d_model,
+            use_quality_gating=quality_gated,
+            bidirectional=bidirectional,
+        )
+        self.pose_layer = (
+            BiMambaLayer(d_model, use_quality_gating=False, bidirectional=bidirectional)
+            if use_pose_stream
+            else None
         )
 
-        # 流交互参数γ：可学习参数（符合文档要求）
-        self.gamma = nn.Parameter(torch.tensor(alpha_pose_to_id, dtype=torch.float32))
+        self.id_norm = nn.LayerNorm(d_model)
+        self.pose_norm = nn.LayerNorm(d_model) if use_pose_stream else None
+        self.pose_fusion = nn.Linear(2 * d_model, d_model) if bidirectional and use_pose_stream else None
+        self.fusion_gate = (
+            nn.Sequential(
+                nn.Linear(d_model, d_model),
+                nn.Sigmoid(),
+            )
+            if bidirectional
+            else None
+        )
 
-    def forward(self, x_id: torch.Tensor, x_pose: torch.Tensor, sigma2: Optional[torch.Tensor] = None):
-        """
-        Args:
-            x_id: (B, T, D)
-            x_pose: (B, T, D)
-            sigma2: (B, T, 1)
-        Returns:
-            out_id, out_pose: (B, T, D)
-        """
-        # ========== 身份流：受不确定性影响 ==========
+        if self.use_pose_to_id:
+            self.gamma = nn.Parameter(torch.tensor(alpha_pose_to_id, dtype=torch.float32))
+        else:
+            self.register_parameter("gamma", None)
+
+    def forward(
+        self,
+        x_id: torch.Tensor,
+        x_pose: Optional[torch.Tensor],
+        sigma2: Optional[torch.Tensor] = None,
+    ):
         id_res = x_id
         id_fwd, id_bwd = self.id_layer(x_id, sigma2)
-        
-        # 自适应融合（仅在Block层面进行一次）
-        # z = sigmoid(gate_network(fwd + bwd))
-        z = self.fusion_gate(id_fwd + id_bwd)  # (B, T, D)
-        id_bi = z * id_fwd + (1.0 - z) * id_bwd  # (B, T, D)
-        
-        # LayerNorm + 残差连接
+
+        if id_bwd is None or self.fusion_gate is None:
+            id_bi = id_fwd
+        else:
+            z = self.fusion_gate(id_fwd + id_bwd)
+            id_bi = z * id_fwd + (1.0 - z) * id_bwd
         id_out = self.id_norm(id_bi) + id_res
 
-        # ========== 非身份流：正常 Mamba ==========
-        pose_res = x_pose
-        pose_fwd, pose_bwd = self.pose_layer(x_pose, None)
-        
-        # 非身份流也进行双向融合（拼接后线性变换）
-        pose_cat = torch.cat([pose_fwd, pose_bwd], dim=-1)
-        pose_bi = self.pose_fusion(pose_cat)
-        pose_out = self.pose_norm(pose_bi) + pose_res
+        pose_out = None
+        if self.use_pose_stream and self.pose_layer is not None and x_pose is not None:
+            pose_res = x_pose
+            pose_fwd, pose_bwd = self.pose_layer(x_pose, None)
 
-        # ========== 姿态信息注入身份流 (no gradient) ==========
-        id_out = id_out + self.gamma * stop_gradient(pose_out)
+            if pose_bwd is None or self.pose_fusion is None:
+                pose_bi = pose_fwd
+            else:
+                pose_cat = torch.cat([pose_fwd, pose_bwd], dim=-1)
+                pose_bi = self.pose_fusion(pose_cat)
+            pose_out = self.pose_norm(pose_bi) + pose_res  # type: ignore[arg-type]
+
+            if self.gamma is not None:
+                id_out = id_out + self.gamma * stop_gradient(pose_out)
 
         return id_out, pose_out
