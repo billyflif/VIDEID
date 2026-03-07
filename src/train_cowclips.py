@@ -1,10 +1,10 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import argparse
 import copy
 import json
 import random
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -12,7 +12,7 @@ import cv2
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from torch.utils.data import DataLoader, Dataset
 
 try:
@@ -65,7 +65,95 @@ def ensure_runtime_dependencies() -> None:
     raise RuntimeError("\n".join(lines))
 
 
+# ---------------------------------------------------------------------------
+# Seek-based video loading (TODO-19)
+# ---------------------------------------------------------------------------
+
+def _load_video_seek(
+    path: Path,
+    frames_per_clip: int,
+    resize: Tuple[int, int],
+    random_sample: bool = False,
+) -> torch.Tensor:
+    """Seek-based 帧采样：先获取总帧数，再用 seek 读取目标帧，避免读取全部帧。"""
+    cap = cv2.VideoCapture(str(path))
+    if not cap.isOpened():
+        raise RuntimeError(f"Failed to open video: {path}")
+
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    if total_frames <= 0:
+        # Fallback: 顺序读取全部帧
+        cap.release()
+        return _load_video_sequential(path, frames_per_clip, resize, random_sample)
+
+    # 计算目标帧索引
+    if random_sample:
+        if total_frames >= frames_per_clip:
+            target_idxs = sorted(random.sample(range(total_frames), frames_per_clip))
+        else:
+            target_idxs = sorted(random.choices(range(total_frames), k=frames_per_clip))
+    else:
+        target_idxs = np.linspace(0, total_frames - 1, num=frames_per_clip, dtype=int).tolist()
+
+    sampled: List[np.ndarray] = []
+    for idx in target_idxs:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+        ok, frame = cap.read()
+        if not ok:
+            # Seek 失败，fallback 到顺序读取
+            cap.release()
+            return _load_video_sequential(path, frames_per_clip, resize, random_sample)
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        frame = cv2.resize(frame, (resize[1], resize[0]))
+        sampled.append(frame)
+    cap.release()
+
+    arr = np.stack(sampled, axis=0).astype("float32") / 255.0
+    return torch.from_numpy(arr).permute(0, 3, 1, 2)
+
+
+def _load_video_sequential(
+    path: Path,
+    frames_per_clip: int,
+    resize: Tuple[int, int],
+    random_sample: bool = False,
+) -> torch.Tensor:
+    """顺序读取全部帧后采样（fallback）。"""
+    cap = cv2.VideoCapture(str(path))
+    if not cap.isOpened():
+        raise RuntimeError(f"Failed to open video: {path}")
+    frames: List[np.ndarray] = []
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            break
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        frame = cv2.resize(frame, (resize[1], resize[0]))
+        frames.append(frame)
+    cap.release()
+    if not frames:
+        raise RuntimeError(f"Empty video file: {path}")
+
+    if random_sample:
+        if len(frames) >= frames_per_clip:
+            idxs = sorted(random.sample(range(len(frames)), frames_per_clip))
+        else:
+            idxs = sorted(random.choices(range(len(frames)), k=frames_per_clip))
+    else:
+        idxs = np.linspace(0, len(frames) - 1, num=frames_per_clip, dtype=int).tolist()
+
+    sampled = [frames[i] for i in idxs]
+    arr = np.stack(sampled, axis=0).astype("float32") / 255.0
+    return torch.from_numpy(arr).permute(0, 3, 1, 2)
+
+
+# ---------------------------------------------------------------------------
+# Dataset classes
+# ---------------------------------------------------------------------------
+
 class VideoCowClipsDataset(Dataset):
+    """基于 clip1/clip2 的视频数据集（tracklet_halves 协议）。"""
+
     _IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
     _IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
 
@@ -115,24 +203,7 @@ class VideoCowClipsDataset(Dataset):
         return len(self.samples)
 
     def _load_video(self, path: Path) -> torch.Tensor:
-        cap = cv2.VideoCapture(str(path))
-        if not cap.isOpened():
-            raise RuntimeError(f"Failed to open video: {path}")
-        frames: List[np.ndarray] = []
-        while True:
-            ok, frame = cap.read()
-            if not ok:
-                break
-            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            frame = cv2.resize(frame, (self.resize[1], self.resize[0]))
-            frames.append(frame)
-        cap.release()
-        if not frames:
-            raise RuntimeError(f"Empty video file: {path}")
-        idxs = np.linspace(0, len(frames) - 1, num=self.frames_per_clip, dtype=int)
-        sampled = [frames[i] for i in idxs]
-        arr = np.stack(sampled, axis=0).astype("float32") / 255.0
-        return torch.from_numpy(arr).permute(0, 3, 1, 2)
+        return _load_video_seek(path, self.frames_per_clip, self.resize, random_sample=False)
 
     def __getitem__(self, idx: int):
         video_path, label = self.samples[idx]
@@ -143,13 +214,75 @@ class VideoCowClipsDataset(Dataset):
         return video, label
 
 
+class StrictReIDDataset(Dataset):
+    """支持原始视频加载的 Dataset 类，用于 strict_reid 协议 (TODO-2)。
+    从 manifest 中解析的视频路径列表加载原始 .mp4 文件。
+    训练模式：从完整原始视频中随机采样 frames_per_clip 帧。
+    评测模式：从完整原始视频中均匀采样 frames_per_clip 帧（确定性）。
+    """
+
+    _IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
+    _IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
+
+    def __init__(
+        self,
+        entries: List[Dict[str, str]],
+        data_root: Path,
+        frames_per_clip: int = 8,
+        resize: Tuple[int, int] = (224, 224),
+        is_train: bool = True,
+        augmentation: Optional["VideoAugmentation"] = None,
+    ) -> None:
+        super().__init__()
+        self.frames_per_clip = frames_per_clip
+        self.resize = resize
+        self.is_train = is_train
+        self.augmentation = augmentation
+        self.data_root = Path(data_root)
+
+        # Build id_list and id2label
+        unique_ids = sorted(set(e["id"] for e in entries))
+        self.id_list = unique_ids
+        self.id2label = {id_name: idx for idx, id_name in enumerate(unique_ids)}
+
+        # Build samples: (path, label)
+        self.samples: List[Tuple[Path, int]] = []
+        for entry in entries:
+            video_path = self.data_root / entry["path"]
+            label = self.id2label[entry["id"]]
+            self.samples.append((video_path, label))
+
+        if not self.samples:
+            raise RuntimeError("No video entries provided to StrictReIDDataset")
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def _load_video(self, path: Path) -> torch.Tensor:
+        return _load_video_seek(path, self.frames_per_clip, self.resize, random_sample=self.is_train)
+
+    def __getitem__(self, idx: int):
+        video_path, label = self.samples[idx]
+        video = self._load_video(video_path)
+        if self.augmentation is not None:
+            video = self.augmentation(video)
+        video = (video - self._IMAGENET_MEAN) / self._IMAGENET_STD
+        return video, label
+
+
+# ---------------------------------------------------------------------------
+# Collate, sampler, class weights
+# ---------------------------------------------------------------------------
+
 def collate_fn(batch):
     videos, labels = zip(*batch)
     return torch.stack(videos, dim=0), torch.tensor(labels, dtype=torch.long)
 
 
 class PKBatchSampler:
-    def __init__(self, dataset: VideoCowClipsDataset, p: int = 4, k: int = 2):
+    """P-K batch sampler，兼容 VideoCowClipsDataset 和 StrictReIDDataset。"""
+
+    def __init__(self, dataset, p: int = 4, k: int = 2):
         self.k = k
         self.label_to_indices: Dict[int, List[int]] = {}
         for idx, (_, label) in enumerate(dataset.samples):
@@ -176,7 +309,8 @@ class PKBatchSampler:
         return self._num_batches
 
 
-def compute_class_weights(dataset: VideoCowClipsDataset) -> torch.Tensor:
+def compute_class_weights(dataset) -> torch.Tensor:
+    """兼容 VideoCowClipsDataset 和 StrictReIDDataset。"""
     label_counts: Dict[int, int] = {}
     for _, label in dataset.samples:
         label_counts[label] = label_counts.get(label, 0) + 1
@@ -187,6 +321,10 @@ def compute_class_weights(dataset: VideoCowClipsDataset) -> torch.Tensor:
         weights[label] = total_samples / (num_classes * count)
     return weights
 
+
+# ---------------------------------------------------------------------------
+# Utilities
+# ---------------------------------------------------------------------------
 
 def set_seed(seed: int):
     random.seed(seed)
@@ -205,6 +343,23 @@ def get_lambda_kl_schedule(step: int, warmup_steps: int, target: float, ramp_ste
     return target * progress
 
 
+def get_lambda_mi_schedule(step: int, warmup_steps: int, target: float, ramp_steps: int) -> float:
+    """MI loss 权重的 warmup + ramp schedule (TODO-9)。"""
+    if step < warmup_steps:
+        return 0.0
+    progress = min(1.0, (step - warmup_steps) / max(1, ramp_steps))
+    return target * progress
+
+
+def set_requires_grad(module: nn.Module, enabled: bool) -> None:
+    for param in module.parameters():
+        param.requires_grad = enabled
+
+
+# ---------------------------------------------------------------------------
+# Fold management
+# ---------------------------------------------------------------------------
+
 def split_into_folds(ids: Sequence[str], num_folds: int) -> List[List[str]]:
     if num_folds <= 1:
         return [list(ids)]
@@ -217,6 +372,22 @@ def split_into_folds(ids: Sequence[str], num_folds: int) -> List[List[str]]:
         folds.append(list(ids[start:end]))
         start = end
     return folds
+
+
+def _build_balanced_outer_folds(id_to_count: Dict[str, int], num_folds: int) -> List[List[str]]:
+    """按视频数量贪心分配 ID 到各折，使各折视频总数尽量均衡 (TODO-4)。"""
+    if num_folds <= 1:
+        return [sorted(id_to_count.keys())]
+    if num_folds > len(id_to_count):
+        raise RuntimeError(f"num_folds={num_folds} > num_ids={len(id_to_count)}")
+    ordered_ids = sorted(id_to_count.items(), key=lambda item: (-item[1], item[0]))
+    folds: List[List[str]] = [[] for _ in range(num_folds)]
+    fold_sums = [0 for _ in range(num_folds)]
+    for id_name, count in ordered_ids:
+        target_idx = min(range(num_folds), key=lambda idx: (fold_sums[idx], len(folds[idx]), idx))
+        folds[target_idx].append(id_name)
+        fold_sums[target_idx] += count
+    return [sorted(f) for f in folds]
 
 
 @dataclass
@@ -238,12 +409,28 @@ class FoldPathSpec:
     test_ids: List[str]
 
 
+@dataclass
+class StrictFoldSpec:
+    """strict_reid 协议的折规格 (TODO-1)。"""
+    fold_index: int
+    fold_name: str
+    train_entries: List[Dict[str, str]]
+    val_gallery_entries: List[Dict[str, str]]
+    val_query_entries: List[Dict[str, str]]
+    test_gallery_entries: List[Dict[str, str]]
+    test_query_entries: List[Dict[str, str]]
+    train_ids: List[str]
+    val_ids: List[str]
+    test_ids: List[str]
+
+
 def build_online_folds(
     data_root: Path,
     num_folds: int,
     val_ratio: float,
     seed: int,
 ) -> List[OnlineFoldSpec]:
+    """构建在线划分的折（TODO-4：改用按视频数平衡的贪心分配）。"""
     id_dirs = sorted([p.name for p in data_root.iterdir() if p.is_dir()])
     if len(id_dirs) < 3:
         raise RuntimeError(f"Need at least 3 IDs for train/val/test, found {len(id_dirs)}")
@@ -252,14 +439,27 @@ def build_online_folds(
     if not (0.0 < val_ratio < 0.8):
         raise RuntimeError(f"val_ratio must be in (0, 0.8), got {val_ratio}")
 
+    # 统计每个 ID 的视频数量
+    id_to_count: Dict[str, int] = {}
+    for id_name in id_dirs:
+        id_dir = data_root / id_name
+        clip_count = len(list(id_dir.glob("*_clip1.mp4"))) + len(list(id_dir.glob("*_clip2.mp4")))
+        id_to_count[id_name] = max(clip_count, 1)
+
+    # 使用贪心算法按视频数平衡分配到各折
+    test_folds = _build_balanced_outer_folds(id_to_count, num_folds)
+
+    # 打印各折视频总数，确认均衡
+    for i, fold_ids in enumerate(test_folds):
+        total_vids = sum(id_to_count[x] for x in fold_ids)
+        print(f"  [balanced fold] test fold {i + 1}: {len(fold_ids)} IDs, {total_vids} videos")
+
     rng = random.Random(seed)
-    shuffled = id_dirs[:]
-    rng.shuffle(shuffled)
-    test_folds = split_into_folds(shuffled, num_folds)
+    all_ids = list(id_to_count.keys())
 
     specs: List[OnlineFoldSpec] = []
     for fold_idx, test_ids in enumerate(test_folds):
-        remain = [x for x in shuffled if x not in test_ids]
+        remain = [x for x in all_ids if x not in test_ids]
         rng_fold = random.Random(seed + 10000 + fold_idx)
         rng_fold.shuffle(remain)
         val_n = max(1, int(round(len(remain) * val_ratio)))
@@ -319,6 +519,45 @@ def discover_fold_paths(fold_root: Path) -> List[FoldPathSpec]:
     return specs
 
 
+def parse_strict_manifest(manifest_path: Path) -> Tuple[List[StrictFoldSpec], Path]:
+    """解析 strict_reid_splits.json (TODO-1)。"""
+    with open(manifest_path, "r", encoding="utf-8") as f:
+        manifest = json.load(f)
+    if manifest.get("protocol") != "strict_reid":
+        raise RuntimeError(
+            f"Expected protocol='strict_reid', got '{manifest.get('protocol')}'"
+        )
+    data_root = manifest_path.parent
+
+    specs: List[StrictFoldSpec] = []
+    for fold in manifest["folds"]:
+        spec = StrictFoldSpec(
+            fold_index=fold["fold_index"],
+            fold_name=fold["fold_name"],
+            train_entries=fold["train_videos"],
+            val_gallery_entries=fold["val_gallery"],
+            val_query_entries=fold["val_query"],
+            test_gallery_entries=fold["test_gallery"],
+            test_query_entries=fold["test_query"],
+            train_ids=fold["train_ids"],
+            val_ids=fold["val_ids"],
+            test_ids=fold["test_ids"],
+        )
+        specs.append(spec)
+
+    # 打印 manifest 概要
+    print(f"[strict_reid] Loaded {len(specs)} folds from: {manifest_path}")
+    print(f"  eval_ids: {manifest.get('eval_ids', [])}")
+    print(f"  train_only_ids: {manifest.get('train_only_ids', [])}")
+    print(f"  excluded_ids: {manifest.get('excluded_ids', [])}")
+
+    return specs, data_root
+
+
+# ---------------------------------------------------------------------------
+# Eval loader builders
+# ---------------------------------------------------------------------------
+
 def summarize_clip_layout(root: Path, id_list: Optional[Sequence[str]] = None) -> Dict[str, int]:
     if id_list is None:
         ids = [p.name for p in root.iterdir() if p.is_dir()]
@@ -345,6 +584,10 @@ def build_eval_loaders(
     num_workers: int,
     pin_memory: bool,
 ) -> Tuple[DataLoader, DataLoader]:
+    """构建 tracklet_halves 协议的评测 DataLoader (TODO-3)。
+    注意：此协议使用同一视频的前后半段(clip1/clip2)互检，
+    存在同轨迹信息泄漏，仅用于辅助参考。主实验应使用 strict_reid 协议。
+    """
     gallery_dataset = VideoCowClipsDataset(
         root=root,
         id_list=id_list,
@@ -362,28 +605,57 @@ def build_eval_loaders(
         augmentation=None,
     )
     gallery_loader = DataLoader(
-        gallery_dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-        collate_fn=collate_fn,
+        gallery_dataset, batch_size=batch_size, shuffle=False,
+        num_workers=num_workers, pin_memory=pin_memory, collate_fn=collate_fn,
     )
     query_loader = DataLoader(
-        query_dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-        collate_fn=collate_fn,
+        query_dataset, batch_size=batch_size, shuffle=False,
+        num_workers=num_workers, pin_memory=pin_memory, collate_fn=collate_fn,
     )
     return gallery_loader, query_loader
 
 
-def set_requires_grad(module: nn.Module, enabled: bool) -> None:
-    for param in module.parameters():
-        param.requires_grad = enabled
+def build_strict_eval_loaders(
+    entries_gallery: List[Dict[str, str]],
+    entries_query: List[Dict[str, str]],
+    data_root: Path,
+    frames_per_clip: int,
+    batch_size: int,
+    num_workers: int,
+    pin_memory: bool,
+) -> Tuple[DataLoader, DataLoader]:
+    """构建 strict_reid 协议的评测 DataLoader (TODO-3, TODO-5)。"""
+    # TODO-5: gallery/query 无泄漏断言
+    gallery_paths = set(e["path"] for e in entries_gallery)
+    query_paths = set(e["path"] for e in entries_query)
+    overlap = gallery_paths & query_paths
+    assert len(overlap) == 0, (
+        f"Gallery and query share {len(overlap)} video paths! "
+        f"Strict_reid protocol violated. Overlapping: {overlap}"
+    )
 
+    gallery_ds = StrictReIDDataset(
+        entries=entries_gallery, data_root=data_root,
+        frames_per_clip=frames_per_clip, is_train=False, augmentation=None,
+    )
+    query_ds = StrictReIDDataset(
+        entries=entries_query, data_root=data_root,
+        frames_per_clip=frames_per_clip, is_train=False, augmentation=None,
+    )
+    gallery_loader = DataLoader(
+        gallery_ds, batch_size=batch_size, shuffle=False,
+        num_workers=num_workers, pin_memory=pin_memory, collate_fn=collate_fn,
+    )
+    query_loader = DataLoader(
+        query_ds, batch_size=batch_size, shuffle=False,
+        num_workers=num_workers, pin_memory=pin_memory, collate_fn=collate_fn,
+    )
+    return gallery_loader, query_loader
+
+
+# ---------------------------------------------------------------------------
+# Training loop (TODO-12: single forward, TODO-14: batch-level KL, TODO-9: MI warmup)
+# ---------------------------------------------------------------------------
 
 def train_one_epoch(
     model: nn.Module,
@@ -392,8 +664,18 @@ def train_one_epoch(
     optimizer_model: torch.optim.Optimizer,
     optimizer_mine: Optional[torch.optim.Optimizer],
     device: torch.device,
+    global_step: int,
+    kl_schedule_args: Optional[Dict] = None,
+    mi_schedule_args: Optional[Dict] = None,
     monitor: Optional["UncertaintyMonitor"] = None,
-) -> Dict[str, float]:
+) -> Tuple[Dict[str, float], int]:
+    """
+    训练一个 epoch。
+    - TODO-12: 单次 model forward，MINE 用 detached 特征更新
+    - TODO-14: 每个 batch 更新 lambda_kl
+    - TODO-9: 每个 batch 更新 lambda_mi
+    返回 (metrics_dict, updated_global_step)。
+    """
     model.train()
     criterion.train()
     total_loss = 0.0
@@ -405,17 +687,33 @@ def train_one_epoch(
         videos = videos.to(device)
         labels = labels.to(device)
 
+        # TODO-14: 每个 step 更新 KL schedule
+        if kl_schedule_args is not None:
+            criterion.lambda_kl = get_lambda_kl_schedule(global_step, **kl_schedule_args)
+        # TODO-9: 每个 step 更新 MI schedule
+        if mi_schedule_args is not None:
+            criterion.lambda_mi = get_lambda_mi_schedule(global_step, **mi_schedule_args)
+
+        # TODO-12: 单次 model forward（消除 MINE 的双重 forward）
+        outputs = model(videos)
+
+        # MINE 步：用 detached 特征更新 MINE 网络（不反传梯度到主模型）
         if optimizer_mine is not None and getattr(model, "mine", None) is not None:
             optimizer_mine.zero_grad(set_to_none=True)
-            outputs_mine = model(videos)
-            mi_mine = model.mine(outputs_mine["vid_id"].detach(), outputs_mine["vid_pose"].detach())
+            mi_mine = model.mine(
+                outputs["vid_id"].detach(), outputs["vid_pose"].detach()
+            )
             loss_mine = -mi_mine
             loss_mine.backward()
             torch.nn.utils.clip_grad_norm_(model.mine.parameters(), max_norm=5.0)
             optimizer_mine.step()
             optimizer_mine.zero_grad(set_to_none=True)
             set_requires_grad(model.mine, False)
-        outputs = model(videos)
+
+            # 用更新后的 MINE 重新计算 MI（此次需要对主模型的梯度流）
+            outputs["mi"] = model.mine(outputs["vid_id"], outputs["vid_pose"])
+
+        # 主模型步
         loss, loss_dict = criterion(outputs, labels)
         optimizer_model.zero_grad(set_to_none=True)
         loss.backward()
@@ -438,6 +736,8 @@ def train_one_epoch(
             if stats is not None:
                 monitor_stats_list.append(stats)
 
+        global_step += 1
+
     avg = {key: val / max(total_samples, 1) for key, val in loss_meter.items()}
     avg["total"] = total_loss / max(total_samples, 1)
     if monitor_stats_list:
@@ -446,8 +746,12 @@ def train_one_epoch(
         avg["sigma2_std"] = latest.get("std", 0.0)
         avg["sigma2_frame_variance"] = latest.get("frame_variance_mean", 0.0)
         avg["sigma2_health_status"] = latest.get("health_status", "UNKNOWN")
-    return avg
+    return avg, global_step
 
+
+# ---------------------------------------------------------------------------
+# Evaluation
+# ---------------------------------------------------------------------------
 
 @torch.no_grad()
 def extract_video_features(
@@ -475,6 +779,7 @@ def compute_reid_metrics(
     gallery_labels: torch.Tensor,
     topk: Sequence[int] = (1, 5, 10),
 ) -> Dict[str, float]:
+    # vid_id 已在模型输出端 L2 归一化 (TODO-10)，此处直接计算余弦相似度
     q = torch.nn.functional.normalize(query_feats, dim=1)
     g = torch.nn.functional.normalize(gallery_feats, dim=1)
     sim = torch.matmul(q, g.t())
@@ -532,11 +837,25 @@ def evaluate_reid(
     return compute_reid_metrics(query_feats, query_labels, gallery_feats, gallery_labels)
 
 
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Chapter 5 video ReID training")
-    parser.add_argument("--data-root", type=str, default=None)
-    parser.add_argument("--fold-root", type=str, default=None)
-    parser.add_argument("--run-all-folds", action="store_true", default=True)
+    # Data source (三选一)
+    parser.add_argument("--data-root", type=str, default=None,
+                        help="tracklet_halves online split 的数据目录")
+    parser.add_argument("--fold-root", type=str, default=None,
+                        help="tracklet_halves prepared folds 的目录")
+    parser.add_argument("--strict-manifest", type=str, default=None,
+                        help="strict_reid_splits.json 路径 (TODO-1)")
+
+    parser.add_argument("--protocol", type=str, default="strict_reid",
+                        choices=["strict_reid", "tracklet_halves"],
+                        help="评测协议。strict_reid 为主实验；tracklet_halves 仅辅助参考")
+
+    parser.add_argument("--run-all-folds", action="store_true", default=False)
     parser.add_argument("--fold-index", type=int, default=None)
 
     parser.add_argument("--num-folds", type=int, default=5)
@@ -554,8 +873,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lambda-orth", type=float, default=0.01)
     parser.add_argument("--lambda-temp", type=float, default=0.1)
     parser.add_argument("--lambda-kl", type=float, default=0.01)
+    parser.add_argument("--lambda-pose-aux", type=float, default=0.2,
+                        help="辅助姿态任务 loss 权重 (TODO-8)")
     parser.add_argument("--kl-warmup-steps", type=int, default=50)
     parser.add_argument("--kl-ramp-steps", type=int, default=100)
+    parser.add_argument("--mi-warmup-steps", type=int, default=50,
+                        help="MI loss warmup 步数 (TODO-9)")
+    parser.add_argument("--mi-ramp-steps", type=int, default=100,
+                        help="MI loss ramp 步数 (TODO-9)")
+    parser.add_argument("--warmup-epochs", type=int, default=5,
+                        help="LR warmup epoch 数 (TODO-15)")
+    parser.add_argument("--patience", type=int, default=15,
+                        help="Early stopping patience (TODO-20)")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--num-workers", type=int, default=0)
@@ -566,6 +895,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--use-wandb", action="store_true")
     parser.add_argument("--wandb-project", type=str, default="video_reid_cowclips")
     parser.add_argument("--wandb-run-name", type=str, default=None)
+    # Ablation switches
     parser.add_argument("--disable-quality-gate", action="store_true")
     parser.add_argument("--disable-bidirectional", action="store_true")
     parser.add_argument("--disable-pose-stream", action="store_true")
@@ -575,14 +905,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--disable-orth-loss", action="store_true")
     parser.add_argument("--disable-temp-loss", action="store_true")
     parser.add_argument("--disable-kl-loss", action="store_true")
+    parser.add_argument("--disable-pose-aux", action="store_true",
+                        help="禁用辅助姿态任务 (TODO-8 消融)")
     return parser.parse_args()
 
 
+# ---------------------------------------------------------------------------
+# Config builders
+# ---------------------------------------------------------------------------
+
 def select_fold_specs(
-    all_specs: Sequence[FoldPathSpec],
+    all_specs,
     fold_index: Optional[int],
     run_all_folds: bool,
-) -> List[FoldPathSpec]:
+):
     if fold_index is None and run_all_folds:
         return list(all_specs)
     if fold_index is None and not run_all_folds:
@@ -609,6 +945,7 @@ def build_loss_config(args: argparse.Namespace, model_config: Dict[str, bool]) -
         "lambda_orth": 0.0 if args.disable_orth_loss or not use_pose_stream else args.lambda_orth,
         "lambda_temp": 0.0 if args.disable_temp_loss else args.lambda_temp,
         "lambda_kl": 0.0 if args.disable_kl_loss else args.lambda_kl,
+        "lambda_pose_aux": 0.0 if args.disable_pose_aux or not use_pose_stream else args.lambda_pose_aux,
     }
 
 
@@ -623,15 +960,26 @@ def format_toggle_status(config: Dict[str, bool], loss_config: Dict[str, float])
         f"orth_loss={'on' if loss_config['lambda_orth'] > 0 else 'off'}",
         f"temp_loss={'on' if loss_config['lambda_temp'] > 0 else 'off'}",
         f"kl_loss={'on' if loss_config['lambda_kl'] > 0 else 'off'}",
+        f"pose_aux={'on' if loss_config.get('lambda_pose_aux', 0) > 0 else 'off'}",
     ]
     return ", ".join(parts)
 
 
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
 def main() -> None:
     args = parse_args()
     ensure_runtime_dependencies()
-    if args.fold_root is None and args.data_root is None:
-        raise RuntimeError("Either --fold-root or --data-root must be provided.")
+
+    has_strict = args.strict_manifest is not None
+    has_fold = args.fold_root is not None
+    has_data = args.data_root is not None
+    if not (has_strict or has_fold or has_data):
+        raise RuntimeError(
+            "Must provide one of: --strict-manifest, --fold-root, or --data-root."
+        )
 
     if args.device == "cuda" and not torch.cuda.is_available():
         device = torch.device("cpu")
@@ -652,105 +1000,155 @@ def main() -> None:
     if use_wandb:
         try:
             import wandb
-
             wandb.init(project=args.wandb_project, name=args.wandb_run_name, config=vars(args))
         except ImportError:
             use_wandb = False
             print("[WARN] wandb not installed, disabling wandb logging.")
 
-    if args.fold_root is not None:
+    # 确定协议和数据模式
+    protocol = args.protocol
+    use_strict_mode = has_strict or (protocol == "strict_reid")
+
+    if use_strict_mode and has_strict:
+        # ---- strict_reid 主实验路径 (TODO-1) ----
+        strict_specs, strict_data_root = parse_strict_manifest(Path(args.strict_manifest))
+        selected_strict = select_fold_specs(strict_specs, args.fold_index, args.run_all_folds)
+        protocol = "strict_reid"
+        print(f"[Protocol] strict_reid, {len(selected_strict)} fold(s) selected")
+    elif has_fold:
+        # ---- tracklet_halves prepared folds ----
         all_fold_specs = discover_fold_paths(Path(args.fold_root))
         selected_specs = select_fold_specs(all_fold_specs, args.fold_index, args.run_all_folds)
-        print(f"Using prepared folds from: {args.fold_root}")
+        protocol = "tracklet_halves"
+        print(f"[Protocol] tracklet_halves (prepared folds from {args.fold_root})")
+        print("[WARN] tracklet_halves 协议使用同轨迹 clip1/clip2 互检，存在信息泄漏，仅用于辅助参考")
+        selected_strict = None
     else:
+        # ---- tracklet_halves online split ----
         data_root = Path(args.data_root)
         clip_stats = summarize_clip_layout(data_root)
         if clip_stats["clip1"] == 0 or clip_stats["clip2"] == 0:
             raise RuntimeError(
-                f"No clip pairs found in {data_root} (clip1={clip_stats['clip1']}, clip2={clip_stats['clip2']})."
+                f"No clip pairs found in {data_root} "
+                f"(clip1={clip_stats['clip1']}, clip2={clip_stats['clip2']})."
             )
         online_specs = build_online_folds(data_root, args.num_folds, args.val_ratio, args.seed)
         all_fold_specs = [
             FoldPathSpec(
                 fold_name=f"fold{spec.fold_index:02d}",
-                train_root=data_root,
-                val_root=data_root,
-                test_root=data_root,
-                train_ids=spec.train_ids,
-                val_ids=spec.val_ids,
-                test_ids=spec.test_ids,
+                train_root=data_root, val_root=data_root, test_root=data_root,
+                train_ids=spec.train_ids, val_ids=spec.val_ids, test_ids=spec.test_ids,
             )
             for spec in online_specs
         ]
         selected_specs = select_fold_specs(all_fold_specs, args.fold_index, args.run_all_folds)
-        print(f"Using online split mode from: {data_root}")
+        protocol = "tracklet_halves"
+        print(f"[Protocol] tracklet_halves (online split from {data_root})")
+        print("[WARN] tracklet_halves 协议使用同轨迹 clip1/clip2 互检，存在信息泄漏，仅用于辅助参考")
+        selected_strict = None
 
     model_config = build_ablation_config(args)
     loss_config = build_loss_config(args, model_config)
     all_fold_metrics: List[Dict[str, float]] = []
 
-    for fold_idx, fold_spec in enumerate(selected_specs, start=1):
+    # 构建迭代列表
+    if selected_strict is not None:
+        fold_iter = selected_strict
+    else:
+        fold_iter = selected_specs
+
+    for fold_idx, fold_spec in enumerate(fold_iter, start=1):
+        if isinstance(fold_spec, StrictFoldSpec):
+            fold_name = fold_spec.fold_name
+            train_ids = fold_spec.train_ids
+            val_ids = fold_spec.val_ids
+            test_ids = fold_spec.test_ids
+        else:
+            fold_name = fold_spec.fold_name
+            train_ids = fold_spec.train_ids
+            val_ids = fold_spec.val_ids
+            test_ids = fold_spec.test_ids
+
         print(f"\n{'=' * 72}")
-        print(f"Fold {fold_idx}/{len(selected_specs)}: {fold_spec.fold_name}")
-        print(
-            f"Train IDs={len(fold_spec.train_ids)}, "
-            f"Val IDs={len(fold_spec.val_ids)}, "
-            f"Test IDs={len(fold_spec.test_ids)}"
-        )
+        print(f"Fold {fold_idx}/{len(fold_iter)}: {fold_name}")
+        print(f"Train IDs={len(train_ids)}, Val IDs={len(val_ids)}, Test IDs={len(test_ids)}")
+        print(f"Protocol: {protocol}")
         print(f"Ablations: {format_toggle_status(model_config, loss_config)}")
         print(f"{'=' * 72}")
 
-        train_stats = summarize_clip_layout(fold_spec.train_root, fold_spec.train_ids)
-        val_stats = summarize_clip_layout(fold_spec.val_root, fold_spec.val_ids)
-        test_stats = summarize_clip_layout(fold_spec.test_root, fold_spec.test_ids)
-        print(f"Train clips: clip1={train_stats['clip1']}, clip2={train_stats['clip2']}")
-        print(f"Val clips:   clip1={val_stats['clip1']}, clip2={val_stats['clip2']}")
-        print(f"Test clips:  clip1={test_stats['clip1']}, clip2={test_stats['clip2']}")
-        for split_name, stats in (("train", train_stats), ("val", val_stats), ("test", test_stats)):
-            if stats["clip1"] == 0 or stats["clip2"] == 0:
-                raise RuntimeError(
-                    f"Fold {fold_spec.fold_name} split={split_name} has missing clips: "
-                    f"clip1={stats['clip1']}, clip2={stats['clip2']}"
-                )
+        # TODO-5: 打印 gallery/query 样本数和 ID 分布
+        if isinstance(fold_spec, StrictFoldSpec):
+            print(f"  Train entries: {len(fold_spec.train_entries)}")
+            print(f"  Val gallery: {len(fold_spec.val_gallery_entries)}, "
+                  f"Val query: {len(fold_spec.val_query_entries)}")
+            print(f"  Test gallery: {len(fold_spec.test_gallery_entries)}, "
+                  f"Test query: {len(fold_spec.test_query_entries)}")
 
-        train_dataset = VideoCowClipsDataset(
-            root=fold_spec.train_root,
-            id_list=fold_spec.train_ids,
-            use_clip="both",
-            frames_per_clip=args.frames_per_clip,
-            resize=(224, 224),
-            augmentation=VideoAugmentation(
-                use_occlusion=True,
-                use_blur=True,
-                use_brightness=True,
-                occlusion_prob=0.5,
-                blur_prob=0.5,
-                brightness_prob=0.5,
-            ),
-        )
-        train_loader = DataLoader(
-            train_dataset,
-            batch_sampler=PKBatchSampler(train_dataset, p=4, k=2),
-            num_workers=args.num_workers,
-            pin_memory=pin_memory,
-            collate_fn=collate_fn,
-        )
-        val_gallery_loader, val_query_loader = build_eval_loaders(
-            fold_spec.val_root,
-            fold_spec.val_ids,
-            args.frames_per_clip,
-            args.batch_size,
-            args.num_workers,
-            pin_memory,
-        )
-        test_gallery_loader, test_query_loader = build_eval_loaders(
-            fold_spec.test_root,
-            fold_spec.test_ids,
-            args.frames_per_clip,
-            args.batch_size,
-            args.num_workers,
-            pin_memory,
-        )
+            # 构建 strict 模式的数据加载器
+            train_dataset = StrictReIDDataset(
+                entries=fold_spec.train_entries,
+                data_root=strict_data_root,
+                frames_per_clip=args.frames_per_clip,
+                is_train=True,
+                augmentation=VideoAugmentation(
+                    use_occlusion=True, use_blur=True, use_brightness=True,
+                    occlusion_prob=0.5, blur_prob=0.5, brightness_prob=0.5,
+                ),
+            )
+            train_loader = DataLoader(
+                train_dataset,
+                batch_sampler=PKBatchSampler(train_dataset, p=4, k=2),
+                num_workers=args.num_workers, pin_memory=pin_memory, collate_fn=collate_fn,
+            )
+
+            # TODO-3, TODO-5: strict 模式的评测 DataLoader
+            val_gallery_loader, val_query_loader = build_strict_eval_loaders(
+                fold_spec.val_gallery_entries, fold_spec.val_query_entries,
+                strict_data_root, args.frames_per_clip, args.batch_size,
+                args.num_workers, pin_memory,
+            )
+            test_gallery_loader, test_query_loader = build_strict_eval_loaders(
+                fold_spec.test_gallery_entries, fold_spec.test_query_entries,
+                strict_data_root, args.frames_per_clip, args.batch_size,
+                args.num_workers, pin_memory,
+            )
+        else:
+            # tracklet_halves 模式
+            train_stats = summarize_clip_layout(fold_spec.train_root, train_ids)
+            val_stats = summarize_clip_layout(fold_spec.val_root, val_ids)
+            test_stats = summarize_clip_layout(fold_spec.test_root, test_ids)
+            print(f"Train clips: clip1={train_stats['clip1']}, clip2={train_stats['clip2']}")
+            print(f"Val clips:   clip1={val_stats['clip1']}, clip2={val_stats['clip2']}")
+            print(f"Test clips:  clip1={test_stats['clip1']}, clip2={test_stats['clip2']}")
+            for split_name, stats in (("train", train_stats), ("val", val_stats), ("test", test_stats)):
+                if stats["clip1"] == 0 or stats["clip2"] == 0:
+                    raise RuntimeError(
+                        f"Fold {fold_name} split={split_name} has missing clips: "
+                        f"clip1={stats['clip1']}, clip2={stats['clip2']}"
+                    )
+
+            train_dataset = VideoCowClipsDataset(
+                root=fold_spec.train_root, id_list=train_ids,
+                use_clip="both", frames_per_clip=args.frames_per_clip,
+                resize=(224, 224),
+                augmentation=VideoAugmentation(
+                    use_occlusion=True, use_blur=True, use_brightness=True,
+                    occlusion_prob=0.5, blur_prob=0.5, brightness_prob=0.5,
+                ),
+            )
+            train_loader = DataLoader(
+                train_dataset,
+                batch_sampler=PKBatchSampler(train_dataset, p=4, k=2),
+                num_workers=args.num_workers, pin_memory=pin_memory, collate_fn=collate_fn,
+            )
+            val_gallery_loader, val_query_loader = build_eval_loaders(
+                fold_spec.val_root, val_ids, args.frames_per_clip,
+                args.batch_size, args.num_workers, pin_memory,
+            )
+            test_gallery_loader, test_query_loader = build_eval_loaders(
+                fold_spec.test_root, test_ids, args.frames_per_clip,
+                args.batch_size, args.num_workers, pin_memory,
+            )
 
         class_weights = compute_class_weights(train_dataset).to(device)
         model = VideoReIDModel(
@@ -769,45 +1167,76 @@ def main() -> None:
             lambda_orth=loss_config["lambda_orth"],
             lambda_temp=loss_config["lambda_temp"],
             lambda_kl=loss_config["lambda_kl"],
+            lambda_pose_aux=loss_config.get("lambda_pose_aux", 0.0),
             margin=args.margin,
             use_batch_hard=True,
             class_weights=class_weights,
+            use_pose_aux=not args.disable_pose_aux and model_config["use_pose_stream"],
         ).to(device)
 
         optimizer_model = torch.optim.AdamW(
-            [p for n, p in model.named_parameters() if "mine" not in n] + list(criterion.parameters()),
+            [p for n, p in model.named_parameters() if "mine" not in n]
+            + list(criterion.parameters()),
             lr=args.lr,
             weight_decay=args.weight_decay,
         )
         mine_params = [p for n, p in model.named_parameters() if "mine" in n]
         optimizer_mine = (
-            torch.optim.AdamW(
-                mine_params,
-                lr=args.mine_lr,
-                weight_decay=args.weight_decay,
-            )
+            torch.optim.AdamW(mine_params, lr=args.mine_lr, weight_decay=args.weight_decay)
             if mine_params and loss_config["lambda_mi"] > 0
             else None
         )
         if optimizer_mine is None and getattr(model, "mine", None) is not None:
             set_requires_grad(model.mine, False)
-        scheduler = CosineAnnealingLR(optimizer_model, T_max=args.num_epochs, eta_min=1e-6)
+
+        # TODO-15: LR warmup + CosineAnnealing
+        warmup_epochs = max(0, args.warmup_epochs)
+        cosine_epochs = max(1, args.num_epochs - warmup_epochs)
+        if warmup_epochs > 0:
+            warmup_scheduler = LinearLR(
+                optimizer_model,
+                start_factor=1e-3,
+                end_factor=1.0,
+                total_iters=warmup_epochs,
+            )
+            cosine_scheduler = CosineAnnealingLR(
+                optimizer_model, T_max=cosine_epochs, eta_min=1e-6
+            )
+            scheduler = SequentialLR(
+                optimizer_model,
+                schedulers=[warmup_scheduler, cosine_scheduler],
+                milestones=[warmup_epochs],
+            )
+        else:
+            scheduler = CosineAnnealingLR(optimizer_model, T_max=args.num_epochs, eta_min=1e-6)
+
         monitor = UncertaintyMonitor(window_size=100, threshold=0.01, check_interval=50)
+
+        # Schedule args for batch-level updates
+        kl_schedule_args = {
+            "warmup_steps": args.kl_warmup_steps,
+            "target": loss_config["lambda_kl"],
+            "ramp_steps": args.kl_ramp_steps,
+        } if loss_config["lambda_kl"] > 0 else None
+
+        mi_schedule_args = {
+            "warmup_steps": args.mi_warmup_steps,
+            "target": loss_config["lambda_mi"],
+            "ramp_steps": args.mi_ramp_steps,
+        } if loss_config["lambda_mi"] > 0 else None
 
         global_step = 0
         best_val_map = -1.0
         best_epoch = -1
         best_state = None
-        best_ckpt_path = ckpt_dir / f"{fold_spec.fold_name}_best.pth"
+        best_ckpt_path = ckpt_dir / f"{fold_name}_best.pth"
+        patience_counter = 0  # TODO-20: early stopping
 
         for epoch in range(args.num_epochs):
-            criterion.lambda_kl = get_lambda_kl_schedule(
-                global_step, args.kl_warmup_steps, loss_config["lambda_kl"], args.kl_ramp_steps
+            train_metrics, global_step = train_one_epoch(
+                model, criterion, train_loader, optimizer_model, optimizer_mine,
+                device, global_step, kl_schedule_args, mi_schedule_args, monitor,
             )
-            train_metrics = train_one_epoch(
-                model, criterion, train_loader, optimizer_model, optimizer_mine, device, monitor
-            )
-            global_step += len(train_loader)
             scheduler.step()
 
             val_metrics = evaluate_reid(model, val_gallery_loader, val_query_loader, device)
@@ -820,7 +1249,7 @@ def main() -> None:
                 f"val_rank1={val_metrics.get('rank-1', 0.0):.4f}"
             )
 
-            prefix = f"{fold_spec.fold_name}/"
+            prefix = f"{fold_name}/"
             if writer is not None:
                 for key, value in train_metrics.items():
                     if isinstance(value, (int, float)):
@@ -829,17 +1258,23 @@ def main() -> None:
                     if isinstance(value, (int, float)):
                         writer.add_scalar(f"{prefix}val/{key}", value, epoch)
                 writer.add_scalar(f"{prefix}lr", current_lr, epoch)
+                # TODO-6: 记录协议 tag
+                writer.add_text(f"{prefix}protocol", protocol, epoch)
                 writer.flush()
 
             if use_wandb:
                 import wandb
-
-                wb = {"fold": fold_spec.fold_name, "epoch": epoch + 1, "lr": current_lr}
+                wb = {
+                    "fold": fold_name, "epoch": epoch + 1, "lr": current_lr,
+                    "protocol": protocol,
+                }
                 wb.update(
-                    {f"{prefix}train/{k}": v for k, v in train_metrics.items() if isinstance(v, (int, float))}
+                    {f"{prefix}train/{k}": v for k, v in train_metrics.items()
+                     if isinstance(v, (int, float))}
                 )
                 wb.update(
-                    {f"{prefix}val/{k}": v for k, v in val_metrics.items() if isinstance(v, (int, float))}
+                    {f"{prefix}val/{k}": v for k, v in val_metrics.items()
+                     if isinstance(v, (int, float))}
                 )
                 wandb.log(wb)
 
@@ -848,31 +1283,47 @@ def main() -> None:
                 best_val_map = current_val_map
                 best_epoch = epoch + 1
                 best_state = copy.deepcopy(model.state_dict())
+                patience_counter = 0
                 torch.save(
                     {
                         "model": model.state_dict(),
                         "criterion": criterion.state_dict(),
                         "optimizer_model": optimizer_model.state_dict(),
-                        "optimizer_mine": optimizer_mine.state_dict() if optimizer_mine is not None else None,
+                        "optimizer_mine": (
+                            optimizer_mine.state_dict() if optimizer_mine is not None else None
+                        ),
                         "epoch": best_epoch,
                         "best_val_mAP": best_val_map,
-                        "fold_name": fold_spec.fold_name,
-                        "train_ids": fold_spec.train_ids,
-                        "val_ids": fold_spec.val_ids,
-                        "test_ids": fold_spec.test_ids,
+                        "fold_name": fold_name,
+                        "train_ids": train_ids,
+                        "val_ids": val_ids,
+                        "test_ids": test_ids,
                         "model_config": model_config,
                         "loss_config": loss_config,
                         "args": vars(args),
+                        # TODO-6: 在 checkpoint 中记录协议元信息
+                        "protocol": protocol,
                     },
                     best_ckpt_path,
                 )
-                print(f"    [CKPT] best val_mAP={best_val_map:.4f} at epoch {best_epoch} -> {best_ckpt_path}")
+                print(f"    [CKPT] best val_mAP={best_val_map:.4f} "
+                      f"at epoch {best_epoch} -> {best_ckpt_path}")
+            else:
+                patience_counter += 1
+
+            # TODO-20: Early stopping
+            if args.patience > 0 and patience_counter >= args.patience:
+                print(f"    [EARLY STOP] No improvement for {args.patience} epochs. "
+                      f"Best val_mAP={best_val_map:.4f} at epoch {best_epoch}.")
+                break
 
         if best_state is None:
-            raise RuntimeError(f"No best checkpoint found for {fold_spec.fold_name}.")
+            raise RuntimeError(f"No best checkpoint found for {fold_name}.")
         model.load_state_dict(best_state)
         test_metrics = evaluate_reid(model, test_gallery_loader, test_query_loader, device)
-        fold_result: Dict[str, float] = {"best_val_mAP": best_val_map, "best_epoch": float(best_epoch)}
+        fold_result: Dict[str, float] = {
+            "best_val_mAP": best_val_map, "best_epoch": float(best_epoch),
+        }
         fold_result.update({f"test_{k}": v for k, v in test_metrics.items()})
         all_fold_metrics.append(fold_result)
         print(
@@ -881,8 +1332,9 @@ def main() -> None:
             f"test_rank1={test_metrics.get('rank-1', 0.0):.4f}"
         )
 
+    # Cross-fold summary
     print(f"\n{'=' * 72}")
-    print("Cross-fold summary")
+    print(f"Cross-fold summary (protocol={protocol})")
     print(f"{'=' * 72}")
     if all_fold_metrics:
         keys = sorted(all_fold_metrics[0].keys())
@@ -892,11 +1344,12 @@ def main() -> None:
             mean_val = float(np.mean(values))
             std_val = float(np.std(values))
             summary[key] = {"mean": mean_val, "std": std_val}
-            print(f"{key}: {mean_val:.4f} 卤 {std_val:.4f}")
+            print(f"{key}: {mean_val:.4f} \u00b1 {std_val:.4f}")
         summary_path = ckpt_dir / "cross_fold_summary.json"
         with open(summary_path, "w", encoding="utf-8") as f:
             json.dump(
                 {
+                    "protocol": protocol,
                     "num_folds": len(all_fold_metrics),
                     "metrics_per_fold": all_fold_metrics,
                     "summary": summary,
@@ -914,5 +1367,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-

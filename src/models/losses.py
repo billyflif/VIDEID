@@ -1,3 +1,4 @@
+import random
 from typing import Dict, Optional, Tuple
 
 import torch
@@ -121,16 +122,18 @@ class IDLoss(nn.Module):
                     idx = (labels == y).nonzero(as_tuple=False).view(-1)
                     if len(idx) < 2:
                         continue
-                    # 随机取一对正样本
-                    a, p = idx[0], idx[1]
-                    # 随机取一个负样本
+                    # 真正随机取一对正样本
+                    idx_list = idx.tolist()
+                    sampled = random.sample(idx_list, 2)
+                    a, p = sampled[0], sampled[1]
+                    # 真正随机取一个负样本
                     neg_idx = (labels != y).nonzero(as_tuple=False).view(-1)
                     if len(neg_idx) == 0:
                         continue
-                    n = neg_idx[0]
-                    anchors.append(a)
-                    positives.append(p)
-                    negatives.append(n)
+                    n = random.choice(neg_idx.tolist())
+                    anchors.append(torch.tensor(a, device=labels.device))
+                    positives.append(torch.tensor(p, device=labels.device))
+                    negatives.append(torch.tensor(n, device=labels.device))
 
             triplet_loss = feats.new_tensor(0.0)
             if anchors:
@@ -146,28 +149,30 @@ class IDLoss(nn.Module):
 
 def orthogonal_loss(id_feat: torch.Tensor, pose_feat: torch.Tensor) -> torch.Tensor:
     """
-    正交约束：最小化两组特征的矩阵乘法Frobenius范数
-    L_orth = ||H_ID^T · H_NID||²_F
-    
-    如果输入是(B, D)，则计算 (D, B) × (B, D) = (D, D) 的Frobenius范数
-    如果输入是(B, T, D)，则对时间维度进行矩阵乘法
-    
+    中心化归一化交叉协方差矩阵的非对角线惩罚 (Centered Normalized Cross-Covariance Penalty)。
+    比原始 Frobenius 范数版本更鲁棒：
+    - 中心化消除均值偏移的影响
+    - L2 归一化防止模型通过缩小特征范数来降低 loss
+    - 按特征维度归一化使 loss 与维度无关
+
     Args:
-        id_feat: (B, D) 或 (B, T, D)
-        pose_feat: (B, D) 或 (B, T, D)
+        id_feat: (B, D) 或 (B, T, D) 身份流特征
+        pose_feat: (B, D) 或 (B, T, D) 非身份流特征
+    Returns:
+        loss: 标量
     """
-    if id_feat.dim() == 2:
-        # (B, D) -> (D, B) × (B, D) = (D, D)
-        # H_ID^T: (D, B), H_NID: (B, D)
-        prod = torch.matmul(id_feat.t(), pose_feat)  # (D, D)
-        return torch.norm(prod, p='fro') ** 2
-    elif id_feat.dim() == 3:
-        # (B, T, D) -> 对每个batch计算 (D, T) × (T, D) = (D, D)
-        # H_ID^T: (B, D, T), H_NID: (B, T, D)
-        prod = torch.bmm(id_feat.transpose(1, 2), pose_feat)  # (B, D, D)
-        return torch.norm(prod, p='fro', dim=(1, 2)).mean() ** 2
-    else:
-        raise ValueError(f"Unsupported feature dimension: {id_feat.dim()}")
+    if id_feat.dim() == 3:
+        id_feat = id_feat.reshape(-1, id_feat.size(-1))    # (B*T, D)
+        pose_feat = pose_feat.reshape(-1, pose_feat.size(-1))
+    # 中心化
+    id_feat = id_feat - id_feat.mean(dim=0, keepdim=True)
+    pose_feat = pose_feat - pose_feat.mean(dim=0, keepdim=True)
+    # L2 归一化（沿样本维度）
+    id_feat = F.normalize(id_feat, dim=0)
+    pose_feat = F.normalize(pose_feat, dim=0)
+    # 交叉协方差矩阵
+    cross_cov = id_feat.T @ pose_feat  # (D, D)
+    return cross_cov.pow(2).sum() / id_feat.size(1)
 
 
 def temporal_smoothness_loss(feat: torch.Tensor) -> torch.Tensor:
@@ -197,6 +202,53 @@ def kl_gaussian_regularizer(
     return kl.mean()
 
 
+class TemporalOrderPredictionLoss(nn.Module):
+    """
+    时序顺序预测辅助任务：给非身份流提供正向监督信号。
+    随机打乱帧序列后，让一个小分类头预测是否被打乱（二分类）。
+    确保 pose stream 学习到有意义的时序/动态特征，避免塌缩为无语义残差。
+    """
+
+    def __init__(self, feat_dim: int, shuffle_prob: float = 0.5):
+        super().__init__()
+        self.shuffle_prob = shuffle_prob
+        # 简单的分类头：对时序特征做 mean pooling 后二分类
+        self.classifier = nn.Sequential(
+            nn.Linear(feat_dim, feat_dim // 2),
+            nn.ReLU(inplace=True),
+            nn.Linear(feat_dim // 2, 2),
+        )
+        self.ce = nn.CrossEntropyLoss()
+
+    def forward(self, h_pose: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            h_pose: (B, T, D) 非身份流帧级输出
+        Returns:
+            loss: 标量
+        """
+        B, T, D = h_pose.shape
+        if T <= 1:
+            return h_pose.new_tensor(0.0)
+
+        labels = []
+        features = []
+        for i in range(B):
+            if random.random() < self.shuffle_prob:
+                # 打乱帧顺序
+                perm = torch.randperm(T, device=h_pose.device)
+                features.append(h_pose[i, perm, :].mean(dim=0))
+                labels.append(1)  # 1 = shuffled
+            else:
+                features.append(h_pose[i].mean(dim=0))
+                labels.append(0)  # 0 = original order
+
+        feat = torch.stack(features, dim=0)  # (B, D)
+        label = torch.tensor(labels, device=h_pose.device, dtype=torch.long)
+        logits = self.classifier(feat)
+        return self.ce(logits, label)
+
+
 class VideoReIDCriterion(nn.Module):
     """
     总体损失组合：
@@ -217,9 +269,11 @@ class VideoReIDCriterion(nn.Module):
         lambda_orth: float = 0.01,
         lambda_temp: float = 0.1,
         lambda_kl: float = 0.01,
+        lambda_pose_aux: float = 0.2,
         margin: float = 0.3,
         use_batch_hard: bool = False,
         class_weights: Optional[torch.Tensor] = None,
+        use_pose_aux: bool = True,
     ):
         super().__init__()
         self.id_loss = IDLoss(
@@ -233,6 +287,9 @@ class VideoReIDCriterion(nn.Module):
         self.lambda_orth = lambda_orth
         self.lambda_temp = lambda_temp
         self.lambda_kl = lambda_kl
+        self.lambda_pose_aux = lambda_pose_aux
+        self.use_pose_aux = use_pose_aux
+        self.pose_aux_loss = TemporalOrderPredictionLoss(feat_dim) if use_pose_aux else None
 
     def forward(
         self,
@@ -250,14 +307,22 @@ class VideoReIDCriterion(nn.Module):
         vid_id = outputs["vid_id"]  # (B, D)
         vid_pose = outputs["vid_pose"]  # (B, D)
         h_id = outputs["h_id"]  # (B, T, D)
+        h_pose = outputs["h_pose"]  # (B, T, D)
         sigma2 = outputs["sigma2"]  # (B, T, 1)
         mi_est = outputs["mi"]  # 标量
 
         id_loss, triplet_loss, logits = self.id_loss(vid_id, labels)
         mi_loss = mi_est
-        orth_loss = orthogonal_loss(vid_id, vid_pose)
+        # 使用帧级特征计算正交损失（更充分利用样本，不受 batch size 限制）
+        orth_loss = orthogonal_loss(h_id, h_pose)
         temp_loss = temporal_smoothness_loss(h_id)
         kl_loss = kl_gaussian_regularizer(sigma2)
+
+        # 非身份流辅助监督：时序顺序预测
+        if self.pose_aux_loss is not None and h_pose is not None:
+            pose_aux = self.pose_aux_loss(h_pose)
+        else:
+            pose_aux = vid_id.new_tensor(0.0)
 
         total_loss = (
             id_loss
@@ -266,6 +331,7 @@ class VideoReIDCriterion(nn.Module):
             + self.lambda_orth * orth_loss
             + self.lambda_temp * temp_loss
             + self.lambda_kl * kl_loss
+            + self.lambda_pose_aux * pose_aux
         )
 
         loss_dict = {
@@ -276,6 +342,7 @@ class VideoReIDCriterion(nn.Module):
             "orth": orth_loss.detach(),
             "temp": temp_loss.detach(),
             "kl": kl_loss.detach(),
+            "pose_aux": pose_aux.detach(),
         }
 
         return total_loss, loss_dict

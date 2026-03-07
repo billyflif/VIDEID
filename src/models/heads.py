@@ -82,7 +82,15 @@ class MINEEstimator(nn.Module):
     - 主模型最小化MI估计
     """
 
-    def __init__(self, dim_x: int, dim_y: int, hidden_dim: int = 512, ema_decay: float = 0.99, eps: float = 1e-8):
+    def __init__(
+        self,
+        dim_x: int,
+        dim_y: int,
+        hidden_dim: int = 512,
+        ema_decay: float = 0.99,
+        eps: float = 1e-8,
+        logit_clip: float = 20.0,
+    ):
         super().__init__()
         
         # 三层MLP判别器网络（符合文档要求）
@@ -95,6 +103,7 @@ class MINEEstimator(nn.Module):
         )
         self.ema_decay = ema_decay
         self.eps = eps
+        self.logit_clip = logit_clip
         self.register_buffer("ma_et", torch.tensor(1.0))
 
     def forward(self, x: torch.Tensor, y: torch.Tensor):
@@ -115,16 +124,20 @@ class MINEEstimator(nn.Module):
 
         t_joint = self.net(joint)
         t_marg = self.net(marg)
+        t_joint = torch.clamp(t_joint, min=-self.logit_clip, max=self.logit_clip)
+        t_marg = torch.clamp(t_marg, min=-self.logit_clip, max=self.logit_clip)
 
         # MINE损失: 使用exp(D_φ)的指数滑动平均稳定估计
         et = torch.exp(t_marg)
         if self.training:
             ma_et = self.ma_et * self.ema_decay + (1.0 - self.ema_decay) * et.mean()
+            ma_et = torch.nan_to_num(ma_et, nan=1.0, posinf=1e6, neginf=self.eps)
             self.ma_et = ma_et.detach()
             norm_et = ma_et
         else:
             norm_et = self.ma_et
+        norm_et = torch.clamp(norm_et, min=self.eps, max=1e6)
         mi = t_joint.mean() - torch.log(norm_et + self.eps)
-        return mi
+        return torch.nan_to_num(mi, nan=0.0, posinf=self.logit_clip, neginf=-self.logit_clip)
 
 

@@ -3,6 +3,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torchvision.models import resnet50
 
+try:
+    from torchvision.models import ResNet50_Weights
+except Exception:
+    ResNet50_Weights = None
+
 
 class BayesianVisualStem(nn.Module):
     """
@@ -22,7 +27,11 @@ class BayesianVisualStem(nn.Module):
             dropout: Dropout概率，防止小数据集过拟合
         """
         super().__init__()
-        backbone = resnet50(pretrained=pretrained)
+        if ResNet50_Weights is None:
+            backbone = resnet50(pretrained=pretrained)
+        else:
+            weights = ResNet50_Weights.DEFAULT if pretrained else None
+            backbone = resnet50(weights=weights)
         # 去掉最后的池化与全连接层
         self.stem = nn.Sequential(
             backbone.conv1,

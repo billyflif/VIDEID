@@ -48,44 +48,38 @@ class RandomOcclusion:
         if random.random() > self.prob:
             return video
         
-        # 处理不同的输入维度
+        # 统一处理为 (T, C, H, W) 输入
         is_batch = video.dim() == 5
         if is_batch:
             B, T, C, H, W = video.shape
-            video = video.view(B * T, C, H, W)
+            # 对每个 sample 独立应用遮挡
+            augmented = video.clone()
+            for b in range(B):
+                augmented[b] = self._apply_occlusion_single(augmented[b], T, C, H, W)
+            return augmented
         else:
             T, C, H, W = video.shape
-            video = video.view(T, C, H, W)
-        
-        augmented = video.clone()
-        
+            return self._apply_occlusion_single(video.clone(), T, C, H, W)
+
+    def _apply_occlusion_single(self, video: torch.Tensor, T: int, C: int, H: int, W: int) -> torch.Tensor:
+        """对单个 sample (T, C, H, W) 应用遮挡"""
         for _ in range(self.num_patches):
-            # 随机选择遮挡区域大小
             occlusion_h = int(H * random.uniform(self.min_occlusion_ratio, self.max_occlusion_ratio))
             occlusion_w = int(W * random.uniform(self.min_occlusion_ratio, self.max_occlusion_ratio))
-            
-            # 随机选择位置
             top = random.randint(0, max(1, H - occlusion_h))
             left = random.randint(0, max(1, W - occlusion_w))
-            
-            # 对每一帧应用遮挡（可以随机选择部分帧）
-            num_frames_to_occlude = random.randint(1, video.size(0))
-            frames_to_occlude = random.sample(range(video.size(0)), num_frames_to_occlude)
-            
+
+            # frames_to_occlude 的范围基于 T（帧数），而非 B*T
+            num_frames_to_occlude = random.randint(1, T)
+            frames_to_occlude = random.sample(range(T), num_frames_to_occlude)
+
             for frame_idx in frames_to_occlude:
-                # 使用随机值或黑色遮挡
                 if random.random() < 0.5:
-                    # 黑色遮挡
-                    augmented[frame_idx, :, top:top+occlusion_h, left:left+occlusion_w] = 0.0
+                    video[frame_idx, :, top:top+occlusion_h, left:left+occlusion_w] = 0.0
                 else:
-                    # 随机噪声遮挡
-                    noise = torch.randn_like(augmented[frame_idx, :, top:top+occlusion_h, left:left+occlusion_w])
-                    augmented[frame_idx, :, top:top+occlusion_h, left:left+occlusion_w] = noise
-        
-        if is_batch:
-            augmented = augmented.view(B, T, C, H, W)
-        
-        return augmented
+                    noise = torch.randn_like(video[frame_idx, :, top:top+occlusion_h, left:left+occlusion_w])
+                    video[frame_idx, :, top:top+occlusion_h, left:left+occlusion_w] = noise
+        return video
 
 
 class ArtificialMotionBlur:

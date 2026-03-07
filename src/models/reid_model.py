@@ -2,6 +2,7 @@ from typing import Dict
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from .bvs import BayesianVisualStem
 from .mamba_blocks import RDBMambaBlock
@@ -80,6 +81,10 @@ class VideoReIDModel(nn.Module):
             vid_pose, _ = self.agg(h_pose, sigma2)
         else:
             vid_pose = vid_id.detach()
+
+        # L2 归一化：统一训练（triplet loss）和测试（余弦相似度）的距离度量
+        vid_id = F.normalize(vid_id, p=2, dim=-1)
+        vid_pose = F.normalize(vid_pose, p=2, dim=-1)
 
         # MINE 估计互信息
         mi_est = self.mine(vid_id, vid_pose) if self.mine is not None else vid_id.new_zeros(())

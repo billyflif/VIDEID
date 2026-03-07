@@ -7,6 +7,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+_MAMBA_IMPORT_ERROR: Optional[Exception] = None
+
 try:
     from mamba_ssm.ops.selective_scan_interface import selective_scan_fn, mamba_inner_fn
     from mamba_ssm.modules.mamba_simple import Mamba
@@ -16,6 +18,7 @@ try:
 except Exception as exc:
     from .mamba_reference import Mamba, selective_scan_fn
 
+    _MAMBA_IMPORT_ERROR = exc
     mamba_inner_fn = None
     HAS_SELECTIVE_SCAN = True
     MAMBA_BACKEND = "torch_reference"
@@ -25,6 +28,14 @@ except Exception as exc:
         f"Original import error: {exc!r}",
         RuntimeWarning,
     )
+
+
+def get_mamba_backend_status() -> dict:
+    return {
+        "backend": MAMBA_BACKEND,
+        "has_selective_scan": HAS_SELECTIVE_SCAN,
+        "import_error": repr(_MAMBA_IMPORT_ERROR) if _MAMBA_IMPORT_ERROR is not None else None,
+    }
 
 
 def stop_gradient(x: torch.Tensor) -> torch.Tensor:
@@ -85,6 +96,7 @@ class QualityGatedMamba(nn.Module):
         B_param: torch.Tensor,
         C_param: torch.Tensor,
     ) -> torch.Tensor:
+        delta = delta.to(dtype=x.dtype)
         A = -torch.exp(self.A_log.float()).to(x.device)
         D = self.D.float().to(x.device)
         y = selective_scan_fn(
@@ -127,7 +139,9 @@ class QualityGatedMamba(nn.Module):
             sigma2_expand = sigma2.expand(batch_size, seq_len, self.d_inner)
         else:
             sigma2_expand = self.softplus(self.sigma_proj(sigma2))
-        delta_custom = delta_raw * torch.exp(-self.alpha * sigma2_expand)
+        alpha = self.alpha.to(device=delta_raw.device, dtype=delta_raw.dtype)
+        sigma2_expand = sigma2_expand.to(dtype=delta_raw.dtype)
+        delta_custom = delta_raw * torch.exp(-alpha * sigma2_expand)
 
         y = self._run_scan(x, delta_custom, B_param, C_param)
         y = y * self.act(z)
