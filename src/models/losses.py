@@ -202,28 +202,57 @@ def kl_gaussian_regularizer(
     return kl.mean()
 
 
-class TemporalOrderPredictionLoss(nn.Module):
-    """
-    时序顺序预测辅助任务：给非身份流提供正向监督信号。
-    随机打乱帧序列后，让一个小分类头预测是否被打乱（二分类）。
-    确保 pose stream 学习到有意义的时序/动态特征，避免塌缩为无语义残差。
+class TemporalOrderPredictionHead(nn.Module):
+    """顺序敏感的分类头：GRU 编码 + MLP 二分类。
+    输入 [B, T, D] 的帧级特征，输出 [B, 2] 的 logits（0=正序，1=逆序）。
     """
 
-    def __init__(self, feat_dim: int, shuffle_prob: float = 0.5):
+    def __init__(self, feat_dim: int, hidden_dim: Optional[int] = None, dropout: float = 0.1):
         super().__init__()
-        self.shuffle_prob = shuffle_prob
-        # 简单的分类头：对时序特征做 mean pooling 后二分类
-        self.classifier = nn.Sequential(
-            nn.Linear(feat_dim, feat_dim // 2),
-            nn.ReLU(inplace=True),
-            nn.Linear(feat_dim // 2, 2),
+        hidden_dim = hidden_dim or feat_dim // 2
+        self.gru = nn.GRU(
+            input_size=feat_dim, hidden_size=hidden_dim,
+            batch_first=True, bidirectional=False,
         )
+        self.classifier = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, 2),
+        )
+
+    def forward(self, h: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            h: (B, T, D)
+        Returns:
+            logits: (B, 2)
+        """
+        _, h_n = self.gru(h)          # h_n: (1, B, hidden_dim)
+        return self.classifier(h_n.squeeze(0))
+
+
+class TemporalOrderPredictionLoss(nn.Module):
+    """时序顺序预测辅助任务（正序 vs 逆序二分类）。
+    构造方式：将 batch 中每个样本复制两份——一份保持正序(label=0)，一份时间反转(label=1)，
+    通过 GRU 编码后的分类头判别顺序，用标准 cross-entropy 训练。
+    确保 pose stream 学到有意义的时序/动态特征。
+    """
+
+    def __init__(
+        self,
+        feat_dim: int,
+        hidden_dim: Optional[int] = None,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.head = TemporalOrderPredictionHead(feat_dim, hidden_dim, dropout)
         self.ce = nn.CrossEntropyLoss()
 
     def forward(self, h_pose: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            h_pose: (B, T, D) 非身份流帧级输出
+            h_pose: (B, T, D) 非身份流帧级时序特征
         Returns:
             loss: 标量
         """
@@ -231,22 +260,17 @@ class TemporalOrderPredictionLoss(nn.Module):
         if T <= 1:
             return h_pose.new_tensor(0.0)
 
-        labels = []
-        features = []
-        for i in range(B):
-            if random.random() < self.shuffle_prob:
-                # 打乱帧顺序
-                perm = torch.randperm(T, device=h_pose.device)
-                features.append(h_pose[i, perm, :].mean(dim=0))
-                labels.append(1)  # 1 = shuffled
-            else:
-                features.append(h_pose[i].mean(dim=0))
-                labels.append(0)  # 0 = original order
+        h_forward = h_pose                             # (B, T, D)
+        h_reverse = h_pose.flip(dims=[1])              # (B, T, D) 逆序
 
-        feat = torch.stack(features, dim=0)  # (B, D)
-        label = torch.tensor(labels, device=h_pose.device, dtype=torch.long)
-        logits = self.classifier(feat)
-        return self.ce(logits, label)
+        h_cat = torch.cat([h_forward, h_reverse], dim=0)  # (2B, T, D)
+        labels = torch.cat([
+            h_pose.new_zeros(B, dtype=torch.long),     # 正序 = 0
+            h_pose.new_ones(B, dtype=torch.long),      # 逆序 = 1
+        ])
+
+        logits = self.head(h_cat)                      # (2B, 2)
+        return self.ce(logits, labels)
 
 
 class VideoReIDCriterion(nn.Module):
@@ -274,6 +298,8 @@ class VideoReIDCriterion(nn.Module):
         use_batch_hard: bool = False,
         class_weights: Optional[torch.Tensor] = None,
         use_pose_aux: bool = True,
+        pose_aux_hidden_dim: Optional[int] = None,
+        pose_aux_dropout: float = 0.1,
     ):
         super().__init__()
         self.id_loss = IDLoss(
@@ -289,7 +315,13 @@ class VideoReIDCriterion(nn.Module):
         self.lambda_kl = lambda_kl
         self.lambda_pose_aux = lambda_pose_aux
         self.use_pose_aux = use_pose_aux
-        self.pose_aux_loss = TemporalOrderPredictionLoss(feat_dim) if use_pose_aux else None
+        self.pose_aux_loss = (
+            TemporalOrderPredictionLoss(
+                feat_dim, hidden_dim=pose_aux_hidden_dim, dropout=pose_aux_dropout,
+            )
+            if use_pose_aux
+            else None
+        )
 
     def forward(
         self,
@@ -318,8 +350,13 @@ class VideoReIDCriterion(nn.Module):
         temp_loss = temporal_smoothness_loss(h_id)
         kl_loss = kl_gaussian_regularizer(sigma2)
 
-        # 非身份流辅助监督：时序顺序预测
-        if self.pose_aux_loss is not None and h_pose is not None:
+        # 非身份流辅助监督：时序顺序预测（正序 vs 逆序）
+        if (
+            self.use_pose_aux
+            and self.pose_aux_loss is not None
+            and self.lambda_pose_aux > 0
+            and h_pose is not None
+        ):
             pose_aux = self.pose_aux_loss(h_pose)
         else:
             pose_aux = vid_id.new_tensor(0.0)

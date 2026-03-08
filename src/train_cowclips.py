@@ -232,6 +232,7 @@ class StrictReIDDataset(Dataset):
         resize: Tuple[int, int] = (224, 224),
         is_train: bool = True,
         augmentation: Optional["VideoAugmentation"] = None,
+        id2label: Optional[Dict[str, int]] = None,
     ) -> None:
         super().__init__()
         self.frames_per_clip = frames_per_clip
@@ -243,7 +244,10 @@ class StrictReIDDataset(Dataset):
         # Build id_list and id2label
         unique_ids = sorted(set(e["id"] for e in entries))
         self.id_list = unique_ids
-        self.id2label = {id_name: idx for idx, id_name in enumerate(unique_ids)}
+        if id2label is not None:
+            self.id2label = id2label
+        else:
+            self.id2label = {id_name: idx for idx, id_name in enumerate(unique_ids)}
 
         # Build samples: (path, label)
         self.samples: List[Tuple[Path, int]] = []
@@ -336,6 +340,13 @@ def set_seed(seed: int):
         torch.backends.cudnn.benchmark = False
 
 
+def _worker_init_fn(worker_id: int) -> None:
+    """DataLoader worker 初始化函数，确保每个 worker 有不同但可复现的随机种子。"""
+    worker_seed = torch.initial_seed() % (2**32)
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
+
+
 def get_lambda_kl_schedule(step: int, warmup_steps: int, target: float, ramp_steps: int) -> float:
     if step < warmup_steps:
         return 0.0
@@ -345,6 +356,14 @@ def get_lambda_kl_schedule(step: int, warmup_steps: int, target: float, ramp_ste
 
 def get_lambda_mi_schedule(step: int, warmup_steps: int, target: float, ramp_steps: int) -> float:
     """MI loss 权重的 warmup + ramp schedule (TODO-9)。"""
+    if step < warmup_steps:
+        return 0.0
+    progress = min(1.0, (step - warmup_steps) / max(1, ramp_steps))
+    return target * progress
+
+
+def get_lambda_pose_aux_schedule(step: int, warmup_steps: int, target: float, ramp_steps: int) -> float:
+    """Pose aux loss 权重的 warmup + ramp schedule。"""
     if step < warmup_steps:
         return 0.0
     progress = min(1.0, (step - warmup_steps) / max(1, ramp_steps))
@@ -624,8 +643,10 @@ def build_strict_eval_loaders(
     num_workers: int,
     pin_memory: bool,
 ) -> Tuple[DataLoader, DataLoader]:
-    """构建 strict_reid 协议的评测 DataLoader (TODO-3, TODO-5)。"""
-    # TODO-5: gallery/query 无泄漏断言
+    """构建 strict_reid 协议的评测 DataLoader。
+    gallery 与 query 共享统一的 id2label 映射，确保标签编码一致。
+    """
+    # ---- 路径不重叠断言 ----
     gallery_paths = set(e["path"] for e in entries_gallery)
     query_paths = set(e["path"] for e in entries_query)
     overlap = gallery_paths & query_paths
@@ -634,14 +655,38 @@ def build_strict_eval_loaders(
         f"Strict_reid protocol violated. Overlapping: {overlap}"
     )
 
+    # ---- ID 合法性校验 ----
+    gallery_ids = set(e["id"] for e in entries_gallery)
+    query_ids = set(e["id"] for e in entries_query)
+    assert query_ids.issubset(gallery_ids), (
+        f"Query IDs not subset of gallery IDs! "
+        f"Missing in gallery: {query_ids - gallery_ids}"
+    )
+    assert gallery_ids == query_ids, (
+        f"Gallery/query ID sets differ. "
+        f"Gallery-only: {gallery_ids - query_ids}, Query-only: {query_ids - gallery_ids}"
+    )
+
+    # ---- 统一 id2label 映射 ----
+    all_ids = sorted(gallery_ids | query_ids)
+    shared_id2label = {id_name: idx for idx, id_name in enumerate(all_ids)}
+
     gallery_ds = StrictReIDDataset(
         entries=entries_gallery, data_root=data_root,
         frames_per_clip=frames_per_clip, is_train=False, augmentation=None,
+        id2label=shared_id2label,
     )
     query_ds = StrictReIDDataset(
         entries=entries_query, data_root=data_root,
         frames_per_clip=frames_per_clip, is_train=False, augmentation=None,
+        id2label=shared_id2label,
     )
+
+    # ---- 打印评测集统计 ----
+    print(f"    [strict eval] gallery: {len(entries_gallery)} samples, "
+          f"{len(gallery_ids)} IDs | query: {len(entries_query)} samples, "
+          f"{len(query_ids)} IDs | shared label map: {len(shared_id2label)} IDs")
+
     gallery_loader = DataLoader(
         gallery_ds, batch_size=batch_size, shuffle=False,
         num_workers=num_workers, pin_memory=pin_memory, collate_fn=collate_fn,
@@ -667,6 +712,7 @@ def train_one_epoch(
     global_step: int,
     kl_schedule_args: Optional[Dict] = None,
     mi_schedule_args: Optional[Dict] = None,
+    pose_aux_schedule_args: Optional[Dict] = None,
     monitor: Optional["UncertaintyMonitor"] = None,
 ) -> Tuple[Dict[str, float], int]:
     """
@@ -682,6 +728,9 @@ def train_one_epoch(
     total_samples = 0
     loss_meter: Dict[str, float] = {}
     monitor_stats_list = []
+    sigma2_vals: List[float] = []
+    weight_entropy_vals: List[float] = []
+    weight_max_vals: List[float] = []
 
     for videos, labels in loader:
         videos = videos.to(device)
@@ -693,6 +742,9 @@ def train_one_epoch(
         # TODO-9: 每个 step 更新 MI schedule
         if mi_schedule_args is not None:
             criterion.lambda_mi = get_lambda_mi_schedule(global_step, **mi_schedule_args)
+        # 每个 step 更新 pose_aux schedule
+        if pose_aux_schedule_args is not None:
+            criterion.lambda_pose_aux = get_lambda_pose_aux_schedule(global_step, **pose_aux_schedule_args)
 
         # TODO-12: 单次 model forward（消除 MINE 的双重 forward）
         outputs = model(videos)
@@ -715,6 +767,14 @@ def train_one_epoch(
 
         # 主模型步
         loss, loss_dict = criterion(outputs, labels)
+
+        # NaN/Inf 检查
+        if not torch.isfinite(loss):
+            print(f"[FATAL] Non-finite loss detected at step {global_step}: {loss.item()}")
+            print(f"  loss_dict: {loss_dict}")
+            print(f"  batch labels: {labels.tolist()}")
+            raise RuntimeError(f"Training stopped: non-finite loss at step {global_step}")
+
         optimizer_model.zero_grad(set_to_none=True)
         loss.backward()
         main_params = [p for p in model.parameters() if p.requires_grad]
@@ -736,6 +796,22 @@ def train_one_epoch(
             if stats is not None:
                 monitor_stats_list.append(stats)
 
+        # sigma2 和聚合权重统计
+        with torch.no_grad():
+            s2 = outputs["sigma2"]  # (B, T, 1)
+            sigma2_vals.append(s2.mean().item())
+            if s2.mean().item() < 1e-8 or s2.mean().item() > 1e4:
+                print(f"  [WARN] sigma2 abnormal at step {global_step}: "
+                      f"mean={s2.mean().item():.6f}, std={s2.std().item():.6f}")
+            w = outputs.get("weights")  # (B, T, 1)
+            if w is not None:
+                w_squeezed = w.squeeze(-1)  # (B, T)
+                # 权重熵：越高越均匀
+                log_w = torch.log(w_squeezed.clamp(min=1e-8))
+                entropy = -(w_squeezed * log_w).sum(dim=-1).mean().item()
+                weight_entropy_vals.append(entropy)
+                weight_max_vals.append(w_squeezed.max(dim=-1).values.mean().item())
+
         global_step += 1
 
     avg = {key: val / max(total_samples, 1) for key, val in loss_meter.items()}
@@ -746,6 +822,13 @@ def train_one_epoch(
         avg["sigma2_std"] = latest.get("std", 0.0)
         avg["sigma2_frame_variance"] = latest.get("frame_variance_mean", 0.0)
         avg["sigma2_health_status"] = latest.get("health_status", "UNKNOWN")
+    if sigma2_vals:
+        avg["sigma2_mean"] = float(np.mean(sigma2_vals))
+        avg["sigma2_std"] = float(np.std(sigma2_vals))
+    if weight_entropy_vals:
+        avg["weight_entropy"] = float(np.mean(weight_entropy_vals))
+    if weight_max_vals:
+        avg["weight_max"] = float(np.mean(weight_max_vals))
     return avg, global_step
 
 
@@ -837,6 +920,52 @@ def evaluate_reid(
     return compute_reid_metrics(query_feats, query_labels, gallery_feats, gallery_labels)
 
 
+@torch.no_grad()
+def export_frame_quality_analysis(
+    model: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    split_name: str,
+    output_path: Path,
+    topk: int = 3,
+) -> None:
+    """导出帧级质量分析数据（sigma2、聚合权重、top-k 帧索引）供论文可视化。"""
+    model.eval()
+    records = []
+    sample_idx = 0
+    for videos, labels in loader:
+        videos = videos.to(device)
+        outputs = model(videos)
+        sigma2 = outputs["sigma2"]      # (B, T, 1)
+        weights = outputs["weights"]    # (B, T, 1)
+        B = videos.size(0)
+        for i in range(B):
+            s2 = sigma2[i].squeeze(-1).cpu().tolist()      # list of T floats
+            w = weights[i].squeeze(-1).cpu()                # (T,)
+            w_list = w.tolist()
+            T = len(w_list)
+            k = min(topk, T)
+            top_high = torch.topk(w, k).indices.tolist()
+            top_low = torch.topk(w, k, largest=False).indices.tolist()
+            records.append({
+                "sample_idx": sample_idx,
+                "split": split_name,
+                "identity": int(labels[i].item()),
+                "num_frames": T,
+                "sigma2_per_frame": s2,
+                "weight_per_frame": w_list,
+                "top_high_weight_frames": top_high,
+                "top_low_weight_frames": top_low,
+            })
+            sample_idx += 1
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(records, f, ensure_ascii=False, indent=2)
+    print(f"    [EXPORT] Frame quality analysis ({split_name}): "
+          f"{len(records)} samples -> {output_path}")
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -881,6 +1010,12 @@ def parse_args() -> argparse.Namespace:
                         help="MI loss warmup 步数 (TODO-9)")
     parser.add_argument("--mi-ramp-steps", type=int, default=100,
                         help="MI loss ramp 步数 (TODO-9)")
+    parser.add_argument("--pose-aux-warmup-steps", type=int, default=50,
+                        help="Pose aux loss warmup 步数")
+    parser.add_argument("--pose-aux-ramp-steps", type=int, default=100,
+                        help="Pose aux loss ramp 步数")
+    parser.add_argument("--lambda-pose-aux-final", type=float, default=None,
+                        help="Pose aux loss 最终权重（默认等于 --lambda-pose-aux）")
     parser.add_argument("--warmup-epochs", type=int, default=5,
                         help="LR warmup epoch 数 (TODO-15)")
     parser.add_argument("--patience", type=int, default=15,
@@ -907,6 +1042,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--disable-kl-loss", action="store_true")
     parser.add_argument("--disable-pose-aux", action="store_true",
                         help="禁用辅助姿态任务 (TODO-8 消融)")
+    parser.add_argument("--export-frame-quality-analysis", action="store_true",
+                        help="在 best/final 阶段导出帧级质量分析 (sigma2, weights, top-k)")
+    parser.add_argument("--export-topk", type=int, default=3,
+                        help="导出每个视频的 top-k 高/低权重帧索引")
     return parser.parse_args()
 
 
@@ -1009,6 +1148,19 @@ def main() -> None:
     protocol = args.protocol
     use_strict_mode = has_strict or (protocol == "strict_reid")
 
+    # ---- strict_reid 硬约束：禁止隐式回退 ----
+    if protocol == "strict_reid" and not has_strict:
+        raise ValueError(
+            "protocol='strict_reid' requires --strict-manifest to be specified. "
+            "Implicit fallback to tracklet_halves is not allowed."
+        )
+    if protocol == "strict_reid" and has_strict:
+        manifest_path = Path(args.strict_manifest)
+        if not manifest_path.exists():
+            raise FileNotFoundError(
+                f"strict-manifest file does not exist: {manifest_path}"
+            )
+
     if use_strict_mode and has_strict:
         # ---- strict_reid 主实验路径 (TODO-1) ----
         strict_specs, strict_data_root = parse_strict_manifest(Path(args.strict_manifest))
@@ -1073,6 +1225,8 @@ def main() -> None:
         print(f"Fold {fold_idx}/{len(fold_iter)}: {fold_name}")
         print(f"Train IDs={len(train_ids)}, Val IDs={len(val_ids)}, Test IDs={len(test_ids)}")
         print(f"Protocol: {protocol}")
+        if protocol == "strict_reid" and has_strict:
+            print(f"Strict manifest: {args.strict_manifest}")
         print(f"Ablations: {format_toggle_status(model_config, loss_config)}")
         print(f"{'=' * 72}")
 
@@ -1099,6 +1253,7 @@ def main() -> None:
                 train_dataset,
                 batch_sampler=PKBatchSampler(train_dataset, p=4, k=2),
                 num_workers=args.num_workers, pin_memory=pin_memory, collate_fn=collate_fn,
+                worker_init_fn=_worker_init_fn,
             )
 
             # TODO-3, TODO-5: strict 模式的评测 DataLoader
@@ -1140,6 +1295,7 @@ def main() -> None:
                 train_dataset,
                 batch_sampler=PKBatchSampler(train_dataset, p=4, k=2),
                 num_workers=args.num_workers, pin_memory=pin_memory, collate_fn=collate_fn,
+                worker_init_fn=_worker_init_fn,
             )
             val_gallery_loader, val_query_loader = build_eval_loaders(
                 fold_spec.val_root, val_ids, args.frames_per_clip,
@@ -1225,6 +1381,17 @@ def main() -> None:
             "ramp_steps": args.mi_ramp_steps,
         } if loss_config["lambda_mi"] > 0 else None
 
+        pose_aux_target = (
+            args.lambda_pose_aux_final
+            if args.lambda_pose_aux_final is not None
+            else loss_config.get("lambda_pose_aux", 0.0)
+        )
+        pose_aux_schedule_args = {
+            "warmup_steps": args.pose_aux_warmup_steps,
+            "target": pose_aux_target,
+            "ramp_steps": args.pose_aux_ramp_steps,
+        } if loss_config.get("lambda_pose_aux", 0.0) > 0 else None
+
         global_step = 0
         best_val_map = -1.0
         best_epoch = -1
@@ -1235,7 +1402,8 @@ def main() -> None:
         for epoch in range(args.num_epochs):
             train_metrics, global_step = train_one_epoch(
                 model, criterion, train_loader, optimizer_model, optimizer_mine,
-                device, global_step, kl_schedule_args, mi_schedule_args, monitor,
+                device, global_step, kl_schedule_args, mi_schedule_args,
+                pose_aux_schedule_args, monitor,
             )
             scheduler.step()
 
@@ -1245,6 +1413,10 @@ def main() -> None:
                 f"  Epoch {epoch + 1:03d}/{args.num_epochs:03d} "
                 f"lr={current_lr:.2e} "
                 f"loss={train_metrics.get('total', 0.0):.4f} "
+                f"id={train_metrics.get('id', 0.0):.4f} "
+                f"tri={train_metrics.get('triplet', 0.0):.4f} "
+                f"pose_aux={train_metrics.get('pose_aux', 0.0):.4f} "
+                f"(λ={criterion.lambda_pose_aux:.3f}) "
                 f"val_mAP={val_metrics.get('mAP', 0.0):.4f} "
                 f"val_rank1={val_metrics.get('rank-1', 0.0):.4f}"
             )
@@ -1258,8 +1430,9 @@ def main() -> None:
                     if isinstance(value, (int, float)):
                         writer.add_scalar(f"{prefix}val/{key}", value, epoch)
                 writer.add_scalar(f"{prefix}lr", current_lr, epoch)
-                # TODO-6: 记录协议 tag
-                writer.add_text(f"{prefix}protocol", protocol, epoch)
+                writer.add_scalar(f"{prefix}lambda_pose_aux", criterion.lambda_pose_aux, epoch)
+                writer.add_scalar(f"{prefix}lambda_kl", criterion.lambda_kl, epoch)
+                writer.add_scalar(f"{prefix}lambda_mi", criterion.lambda_mi, epoch)
                 writer.flush()
 
             if use_wandb:
@@ -1301,8 +1474,9 @@ def main() -> None:
                         "model_config": model_config,
                         "loss_config": loss_config,
                         "args": vars(args),
-                        # TODO-6: 在 checkpoint 中记录协议元信息
                         "protocol": protocol,
+                        "strict_manifest_path": args.strict_manifest if protocol == "strict_reid" else None,
+                        "fold_index": fold_spec.fold_index if hasattr(fold_spec, "fold_index") else fold_idx,
                     },
                     best_ckpt_path,
                 )
@@ -1321,6 +1495,19 @@ def main() -> None:
             raise RuntimeError(f"No best checkpoint found for {fold_name}.")
         model.load_state_dict(best_state)
         test_metrics = evaluate_reid(model, test_gallery_loader, test_query_loader, device)
+
+        # 帧级质量分析导出
+        if args.export_frame_quality_analysis:
+            export_dir = ckpt_dir / f"{fold_name}_analysis"
+            export_frame_quality_analysis(
+                model, test_gallery_loader, device, "test_gallery",
+                export_dir / "test_gallery_frame_quality.json", topk=args.export_topk,
+            )
+            export_frame_quality_analysis(
+                model, test_query_loader, device, "test_query",
+                export_dir / "test_query_frame_quality.json", topk=args.export_topk,
+            )
+
         fold_result: Dict[str, float] = {
             "best_val_mAP": best_val_map, "best_epoch": float(best_epoch),
         }
@@ -1350,6 +1537,7 @@ def main() -> None:
             json.dump(
                 {
                     "protocol": protocol,
+                    "strict_manifest_path": args.strict_manifest if protocol == "strict_reid" else None,
                     "num_folds": len(all_fold_metrics),
                     "metrics_per_fold": all_fold_metrics,
                     "summary": summary,

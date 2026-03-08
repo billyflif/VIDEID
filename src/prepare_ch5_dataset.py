@@ -354,6 +354,24 @@ def build_strict_reid_manifest(
             }
         )
 
+    # ---- 写出前完整校验 ----
+    for fold_payload in fold_payloads:
+        fi = fold_payload["fold_index"]
+        g_paths = set(e["path"] for e in fold_payload["test_gallery"])
+        q_paths = set(e["path"] for e in fold_payload["test_query"])
+        g_ids = set(e["id"] for e in fold_payload["test_gallery"])
+        q_ids = set(e["id"] for e in fold_payload["test_query"])
+        assert len(g_paths & q_paths) == 0, f"Fold {fi}: test gallery/query paths overlap"
+        assert q_ids.issubset(g_ids), f"Fold {fi}: test query IDs not subset of gallery IDs"
+        assert len(q_ids) >= 1, f"Fold {fi}: no valid test query identities"
+
+        vg_paths = set(e["path"] for e in fold_payload["val_gallery"])
+        vq_paths = set(e["path"] for e in fold_payload["val_query"])
+        vg_ids = set(e["id"] for e in fold_payload["val_gallery"])
+        vq_ids = set(e["id"] for e in fold_payload["val_query"])
+        assert len(vg_paths & vq_paths) == 0, f"Fold {fi}: val gallery/query paths overlap"
+        assert vq_ids.issubset(vg_ids), f"Fold {fi}: val query IDs not subset of val gallery IDs"
+
     return {
         "protocol": "strict_reid",
         "raw_root": str(raw_root),
@@ -365,6 +383,7 @@ def build_strict_reid_manifest(
         "val_ratio": val_ratio,
         "min_videos_per_eval_id": min_videos_per_eval_id,
         "singleton_policy": singleton_policy,
+        "eligible_ids": eval_ids,
         "eval_ids": eval_ids,
         "train_only_ids": train_only_ids,
         "excluded_ids": dropped_ids,
