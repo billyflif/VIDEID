@@ -26,7 +26,7 @@ try:
     from .data_augmentation import VideoAugmentation
     from .monitoring import UncertaintyMonitor
     from .models.losses import VideoReIDCriterion
-    from .models.reid_model import VideoReIDModel
+    from .models.reid_model import SUPPORTED_MODEL_ARCHS, VideoReIDModel
 except Exception as e1:
     try:
         import sys
@@ -36,10 +36,18 @@ except Exception as e1:
         from src.data_augmentation import VideoAugmentation
         from src.monitoring import UncertaintyMonitor
         from src.models.losses import VideoReIDCriterion
-        from src.models.reid_model import VideoReIDModel
+        from src.models.reid_model import SUPPORTED_MODEL_ARCHS, VideoReIDModel
     except Exception as e2:
         _IMPORT_EXCEPTION = e2
         VideoReIDModel = None  # type: ignore[assignment]
+        SUPPORTED_MODEL_ARCHS = (
+            "dual_mamba",
+            "single_mamba",
+            "avgpool",
+            "gru",
+            "lstm",
+            "transformer",
+        )
         VideoReIDCriterion = None  # type: ignore[assignment]
         VideoAugmentation = None  # type: ignore[assignment]
         UncertaintyMonitor = None  # type: ignore[assignment]
@@ -993,6 +1001,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--feat-dim", type=int, default=512)
     parser.add_argument("--num-blocks", type=int, default=4)
+    parser.add_argument(
+        "--model-arch",
+        type=str,
+        default="dual_mamba",
+        choices=list(SUPPORTED_MODEL_ARCHS),
+        help="temporal backbone architecture",
+    )
     parser.add_argument("--frames-per-clip", type=int, default=8)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--mine-lr", type=float, default=1e-3)
@@ -1067,8 +1082,10 @@ def select_fold_specs(
     return [all_specs[fold_index - 1]]
 
 
-def build_ablation_config(args: argparse.Namespace) -> Dict[str, bool]:
-    return {
+def build_model_config(args: argparse.Namespace) -> Dict[str, object]:
+    model_arch = args.model_arch
+    config: Dict[str, object] = {
+        "model_arch": model_arch,
         "use_quality_gating": not args.disable_quality_gate,
         "bidirectional": not args.disable_bidirectional,
         "use_pose_stream": not args.disable_pose_stream,
@@ -1076,9 +1093,40 @@ def build_ablation_config(args: argparse.Namespace) -> Dict[str, bool]:
         "use_uncertainty_weighting": not args.disable_uncertainty_weighting,
     }
 
+    if model_arch == "single_mamba":
+        config["use_pose_stream"] = False
+        config["use_pose_to_id"] = False
+    elif model_arch in {"avgpool", "gru", "lstm", "transformer"}:
+        config["use_quality_gating"] = False
+        config["use_pose_stream"] = False
+        config["use_pose_to_id"] = False
+        config["use_uncertainty_weighting"] = False
 
-def build_loss_config(args: argparse.Namespace, model_config: Dict[str, bool]) -> Dict[str, float]:
-    use_pose_stream = model_config["use_pose_stream"]
+    return config
+
+
+def build_loss_config(args: argparse.Namespace, model_config: Dict[str, object]) -> Dict[str, float]:
+    model_arch = str(model_config["model_arch"])
+    use_pose_stream = bool(model_config["use_pose_stream"])
+
+    if model_arch in {"avgpool", "gru", "lstm", "transformer"}:
+        return {
+            "lambda_mi": 0.0,
+            "lambda_orth": 0.0,
+            "lambda_temp": 0.0,
+            "lambda_kl": 0.0,
+            "lambda_pose_aux": 0.0,
+        }
+
+    if model_arch == "single_mamba":
+        return {
+            "lambda_mi": 0.0,
+            "lambda_orth": 0.0,
+            "lambda_temp": 0.0 if args.disable_temp_loss else args.lambda_temp,
+            "lambda_kl": 0.0 if args.disable_kl_loss else args.lambda_kl,
+            "lambda_pose_aux": 0.0,
+        }
+
     return {
         "lambda_mi": 0.0 if args.disable_mi_loss or not use_pose_stream else args.lambda_mi,
         "lambda_orth": 0.0 if args.disable_orth_loss or not use_pose_stream else args.lambda_orth,
@@ -1088,8 +1136,9 @@ def build_loss_config(args: argparse.Namespace, model_config: Dict[str, bool]) -
     }
 
 
-def format_toggle_status(config: Dict[str, bool], loss_config: Dict[str, float]) -> str:
+def format_toggle_status(config: Dict[str, object], loss_config: Dict[str, float]) -> str:
     parts = [
+        f"arch={config['model_arch']}",
         f"quality_gate={'on' if config['use_quality_gating'] else 'off'}",
         f"bidirectional={'on' if config['bidirectional'] else 'off'}",
         f"pose_stream={'on' if config['use_pose_stream'] else 'off'}",
@@ -1199,7 +1248,7 @@ def main() -> None:
         print("[WARN] tracklet_halves 协议使用同轨迹 clip1/clip2 互检，存在信息泄漏，仅用于辅助参考")
         selected_strict = None
 
-    model_config = build_ablation_config(args)
+    model_config = build_model_config(args)
     loss_config = build_loss_config(args, model_config)
     all_fold_metrics: List[Dict[str, float]] = []
 
@@ -1310,6 +1359,7 @@ def main() -> None:
         model = VideoReIDModel(
             feat_dim=args.feat_dim,
             num_blocks=args.num_blocks,
+            model_arch=str(model_config["model_arch"]),
             use_quality_gating=model_config["use_quality_gating"],
             bidirectional=model_config["bidirectional"],
             use_pose_stream=model_config["use_pose_stream"],

@@ -7,6 +7,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from .mamba_reference import Mamba as ReferenceMamba
+from .mamba_reference import selective_scan_fn as reference_selective_scan_fn
+
 _MAMBA_IMPORT_ERROR: Optional[Exception] = None
 
 try:
@@ -16,9 +19,9 @@ try:
     HAS_SELECTIVE_SCAN = True
     MAMBA_BACKEND = "mamba_ssm_cuda"
 except Exception as exc:
-    from .mamba_reference import Mamba, selective_scan_fn
-
     _MAMBA_IMPORT_ERROR = exc
+    Mamba = ReferenceMamba
+    selective_scan_fn = reference_selective_scan_fn
     mamba_inner_fn = None
     HAS_SELECTIVE_SCAN = True
     MAMBA_BACKEND = "torch_reference"
@@ -40,6 +43,10 @@ def get_mamba_backend_status() -> dict:
 
 def stop_gradient(x: torch.Tensor) -> torch.Tensor:
     return x.detach()
+
+
+def should_use_reference_path(x: torch.Tensor) -> bool:
+    return MAMBA_BACKEND == "mamba_ssm_cuda" and not x.is_cuda
 
 
 class QualityGatedMamba(nn.Module):
@@ -99,7 +106,8 @@ class QualityGatedMamba(nn.Module):
         delta = delta.to(dtype=x.dtype)
         A = -torch.exp(self.A_log.float()).to(x.device)
         D = self.D.float().to(x.device)
-        y = selective_scan_fn(
+        scan_fn = reference_selective_scan_fn if should_use_reference_path(x) else selective_scan_fn
+        y = scan_fn(
             u=x.transpose(1, 2).contiguous(),
             delta=delta.transpose(1, 2).contiguous(),
             A=A,
@@ -158,6 +166,7 @@ class BiMambaLayer(nn.Module):
         bidirectional: bool = True,
     ) -> None:
         super().__init__()
+        self.d_model = d_model
         self.use_quality_gating = use_quality_gating
         self.bidirectional = bidirectional
 
@@ -168,11 +177,20 @@ class BiMambaLayer(nn.Module):
             self.fwd = Mamba(d_model=d_model)
             self.bwd = Mamba(d_model=d_model) if bidirectional else None
 
+    def _forward_reference_clone(self, module: nn.Module, x: torch.Tensor) -> torch.Tensor:
+        ref_module = ReferenceMamba(d_model=self.d_model).to(device=x.device, dtype=x.dtype)
+        ref_module.load_state_dict(module.state_dict())
+        ref_module.eval()
+        return ref_module(x)
+
     def forward(self, x: torch.Tensor, u: Optional[torch.Tensor] = None):
         if self.use_quality_gating and u is not None:
             fwd_out = self.fwd(x, u)
         else:
-            fwd_out = self.fwd(x)
+            if should_use_reference_path(x):
+                fwd_out = self._forward_reference_clone(self.fwd, x)
+            else:
+                fwd_out = self.fwd(x)
 
         if not self.bidirectional or self.bwd is None:
             return fwd_out, None
@@ -182,7 +200,10 @@ class BiMambaLayer(nn.Module):
             rev_u = torch.flip(u, dims=[1])
             bwd_out = self.bwd(rev_x, rev_u)
         else:
-            bwd_out = self.bwd(rev_x)
+            if should_use_reference_path(rev_x):
+                bwd_out = self._forward_reference_clone(self.bwd, rev_x)
+            else:
+                bwd_out = self.bwd(rev_x)
         bwd_out = torch.flip(bwd_out, dims=[1])
         return fwd_out, bwd_out
 
